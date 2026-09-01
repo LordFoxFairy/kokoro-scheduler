@@ -1,0 +1,14 @@
+.git
+.github
+.gitignore
+.dockerignore
+.env
+.env.*
+*.md
+*_test.go
+*.log
+/bin/
+/coverage/
+/dist/
+/scheduler
+/tmp/
