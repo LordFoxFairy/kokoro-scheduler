@@ -11,4 +11,4 @@
 | [README](../README.md) | 本地启动与配置摘要 |
 
 唯一生产入口：`cmd/scheduler/main.go`。
-调度核心：`github.com/robfig/cron/v3`。
+调度核心：`service.go` + `github.com/robfig/cron/v3`；HTTP/Redis 属于 `dispatch.go` adapters。

@@ -38,7 +38,9 @@
 ```text
 kokoro-scheduler/
 ├── cmd/scheduler/main.go   # 唯一生产入口
-├── scheduler.go            # 配置、HTTP runner、cron service
+├── domain.go               # ScheduleJob value model and validation
+├── dispatch.go             # HTTP runner, Redis lease and occurrence identity
+├── service.go              # generic cron application service
 ├── internal_http.go        # BFF internal command and health/readiness adapter
 ├── scheduler_test.go       # scheduler unit/contract tests
 ├── internal_http_test.go   # internal HTTP contract tests
