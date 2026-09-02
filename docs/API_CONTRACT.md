@@ -49,18 +49,14 @@ Idempotency-Key: <mutation-key>
 ```
 
 The service token is configured with `SCHEDULER_INTERNAL_SERVICE_TOKEN` and is
-compared in constant time. For compatibility with existing Kokoro internal
-transport adapters, the same token is also accepted in
-`X-Kokoro-Service-Token` or `X-Kokoro-Internal-Secret`; deployments should use
-the `Authorization` form for this API. `X-Kokoro-Request-Id` is accepted as a
-transport-compatible alias when `X-Request-Id` is absent.
+accepted only as a Bearer token in `Authorization`; it is compared in constant
+time. No legacy credential or request-id headers are accepted.
 
 Missing or invalid authentication returns `401 service_auth_failed`.
 Missing request IDs return `400 request_id_required`; missing idempotency keys
 return `400 idempotency_key_required`. A successful or failed command response
 contains the request ID in `meta.request_id` and the `X-Request-Id` response
-header; `X-Kokoro-Request-Id` is emitted as the transport-compatible response
-alias.
+header.
 
 ### JSON and mutation semantics
 

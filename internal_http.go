@@ -141,28 +141,12 @@ func (h *InternalHandler) authorized(r *http.Request) bool {
 	if h.serviceToken == "" {
 		return false
 	}
-	provided := make([]string, 0, 3)
-	if authorization := strings.TrimSpace(r.Header.Get(InternalServiceToken)); authorization != "" {
-		scheme, token, found := strings.Cut(authorization, " ")
-		if !found || !strings.EqualFold(scheme, "Bearer") || strings.TrimSpace(token) == "" {
-			return false
-		}
-		provided = append(provided, strings.TrimSpace(token))
-	}
-	for _, header := range []string{"X-Kokoro-Service-Token", "X-Kokoro-Internal-Secret"} {
-		if token := strings.TrimSpace(r.Header.Get(header)); token != "" {
-			provided = append(provided, token)
-		}
-	}
-	if len(provided) == 0 {
+	authorization := strings.TrimSpace(r.Header.Get(InternalServiceToken))
+	scheme, token, found := strings.Cut(authorization, " ")
+	if !found || !strings.EqualFold(scheme, "Bearer") || strings.TrimSpace(token) == "" {
 		return false
 	}
-	for _, token := range provided {
-		if subtle.ConstantTimeCompare([]byte(token), []byte(h.serviceToken)) != 1 {
-			return false
-		}
-	}
-	return true
+	return subtle.ConstantTimeCompare([]byte(strings.TrimSpace(token)), []byte(h.serviceToken)) == 1
 }
 
 func (h *InternalHandler) readCommandPayload(r *http.Request, name, action string) (Job, []byte, error) {
@@ -479,12 +463,7 @@ func allowedMethods(action string) string {
 }
 
 func requestIDFrom(r *http.Request) string {
-	requestID := strings.TrimSpace(r.Header.Get("X-Request-Id"))
-	legacyRequestID := strings.TrimSpace(r.Header.Get("X-Kokoro-Request-Id"))
-	if requestID == "" {
-		requestID = legacyRequestID
-	}
-	return requestID
+	return strings.TrimSpace(r.Header.Get(InternalRequestID))
 }
 
 func fingerprint(scope string, payload []byte) string {
@@ -506,7 +485,6 @@ func responseRequestID(body []byte, fallback string) string {
 
 func setResponseRequestID(w http.ResponseWriter, requestID string) {
 	w.Header().Set(InternalRequestID, requestID)
-	w.Header().Set("X-Kokoro-Request-Id", requestID)
 }
 
 func errorResponse(code, message, requestID string) map[string]any {

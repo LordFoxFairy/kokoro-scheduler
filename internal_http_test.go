@@ -170,11 +170,11 @@ func TestInternalHTTPRejectsNonStrictJobJSON(t *testing.T) {
 	}
 }
 
-func TestInternalHTTPAcceptsKokoroTransportAliases(t *testing.T) {
+func TestInternalHTTPRequiresStandardAuthorizationAndRequestID(t *testing.T) {
 	service, handler := newInternalTestHandler()
 	request := httptest.NewRequest(http.MethodPost, "/internal/scheduler/v1/jobs/alias-job", bytes.NewBufferString(`{"schedule":"@every 1m","url":"http://service.test/command"}`))
-	request.Header.Set("X-Kokoro-Internal-Secret", internalTestToken)
-	request.Header.Set("X-Kokoro-Request-Id", "req-alias")
+	request.Header.Set("Authorization", "Bearer "+internalTestToken)
+	request.Header.Set("X-Request-Id", "req-standard")
 	request.Header.Set("Idempotency-Key", "alias-1")
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
@@ -183,7 +183,21 @@ func TestInternalHTTPAcceptsKokoroTransportAliases(t *testing.T) {
 		t.Fatalf("status = %d, want 200: %s", response.Code, response.Body.String())
 	}
 	if _, ok := service.Job("alias-job"); !ok {
-		t.Fatal("alias request did not register the job")
+		t.Fatal("standard request did not register the job")
+	}
+}
+
+func TestInternalHTTPRejectsLegacyCredentialAndRequestIDHeaders(t *testing.T) {
+	_, handler := newInternalTestHandler()
+	request := httptest.NewRequest(http.MethodPost, "/internal/scheduler/v1/jobs/legacy-job", bytes.NewBufferString(`{"schedule":"@every 1m","url":"http://service.test/command"}`))
+	request.Header.Set("X-Kokoro-Internal-Secret", internalTestToken)
+	request.Header.Set("X-Kokoro-Request-Id", "req-legacy")
+	request.Header.Set("Idempotency-Key", "legacy-1")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401: %s", response.Code, response.Body.String())
 	}
 }
 
