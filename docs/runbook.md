@@ -5,6 +5,8 @@
 ```bash
 export SCHEDULER_JOBS_JSON='[]'
 export SCHEDULER_INTERNAL_SERVICE_TOKEN=TOKEN
+# Optional; adds Authorization: Bearer TOKEN to outbound job dispatches.
+export SCHEDULER_TARGET_SERVICE_TOKEN=TOKEN
 go run ./cmd/scheduler
 ```
 
@@ -19,6 +21,9 @@ go run ./cmd/scheduler
 - `SCHEDULER_INTERNAL_SERVICE_TOKEN`：BFF 调用 scheduler internal command 的共享 service
   token。生产环境必须注入；未配置时 scheduler 仍可启动和报告健康，但所有 job command
   返回 `401 service_auth_failed`。
+- `SCHEDULER_TARGET_SERVICE_TOKEN`：可选的 Scheduler 调用目标服务凭据。非空时出站 dispatch
+  携带 `Authorization: Bearer <token>`；留空时不发送该 header，以保持现有 fixture 兼容。该
+  token 与 internal command token 独立，不写入日志；轮换时重新部署 scheduler 和目标服务。
 - `SCHEDULER_HTTP_ADDR`：HTTP server bind address，默认 `:8080`。
 
 Job 的完整字段、internal command 路由、严格 JSON、request ID、幂等和 retry/misfire

@@ -35,7 +35,7 @@ func main() {
 		locker = scheduler.NewRedisLocker(redisClient)
 		defer redisClient.Close()
 	}
-	service := scheduler.NewService(scheduler.NewHTTPRunner(30*time.Second), func(job scheduler.Job, result scheduler.RunResult) {
+	service := scheduler.NewService(scheduler.NewHTTPRunner(30*time.Second, scheduler.TargetServiceTokenFromEnv(os.Getenv)), func(job scheduler.Job, result scheduler.RunResult) {
 		log.Printf("scheduler job=%s status=%d error=%v", job.Name, result.Status, result.Err)
 	}, locker)
 	for _, job := range jobs {

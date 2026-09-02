@@ -129,10 +129,20 @@ type RunResult struct {
 	IdempotencyKey string
 }
 
-type HTTPRunner struct{ client *http.Client }
+type HTTPRunner struct {
+	client             *http.Client
+	targetServiceToken string
+}
 
-func NewHTTPRunner(timeout time.Duration) *HTTPRunner {
-	return &HTTPRunner{client: &http.Client{Timeout: timeout}}
+func NewHTTPRunner(timeout time.Duration, targetServiceTokens ...string) *HTTPRunner {
+	targetServiceToken := ""
+	if len(targetServiceTokens) > 0 {
+		targetServiceToken = strings.TrimSpace(targetServiceTokens[0])
+	}
+	return &HTTPRunner{
+		client:             &http.Client{Timeout: timeout},
+		targetServiceToken: targetServiceToken,
+	}
 }
 func (r *HTTPRunner) Run(ctx context.Context, job Job) RunResult {
 	return r.RunAt(ctx, job, time.Now().UTC())
@@ -152,6 +162,9 @@ func (r *HTTPRunner) RunAt(ctx context.Context, job Job, at time.Time) RunResult
 	request.Header.Set("X-Kokoro-Scheduler-Job", job.Name)
 	request.Header.Set("X-Request-Id", requestID)
 	request.Header.Set("Idempotency-Key", idempotencyKey)
+	if r.targetServiceToken != "" {
+		request.Header.Set("Authorization", "Bearer "+r.targetServiceToken)
+	}
 	response, err := r.client.Do(request)
 	if err != nil {
 		code := "SCHEDULER_TARGET_UNAVAILABLE"

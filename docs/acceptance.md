@@ -22,6 +22,7 @@ go build ./cmd/scheduler
 | internal 严格边界 | 未知字段、null、错误类型、trailing JSON、错误 Content-Type | 请求被拒绝且返回 request_id |
 | internal pause/resume | `/pause`、`/resume` | 复用 Service 控制后续 occurrence，不取消 in-flight dispatch |
 | 成功 dispatch | HTTP Mock 返回 2xx | `succeeded`，含 request/idempotency metadata |
+| 目标服务认证 | HTTP dispatch mock + `SCHEDULER_TARGET_SERVICE_TOKEN` | 配置非空时发送 `Authorization: Bearer <token>`；留空时省略该 header |
 | 目标失败 | Mock 返回 4xx/5xx 或网络错误 | 正确分类，按策略仅重试可重试失败 |
 | pause/resume | Service control fixture | pause 跳过后续 occurrence，resume 恢复 |
 | misfire | `Trigger(scheduledAt, observedAt)` | `skip` 丢弃，`fire_once` 补发一次 |

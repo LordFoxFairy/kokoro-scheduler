@@ -67,9 +67,10 @@ func TestLoadJobsParsesRetryPauseAndMisfirePolicy(t *testing.T) {
 }
 
 func TestHTTPJobRunnerDispatchesWithTimeoutAndHeader(t *testing.T) {
-	var gotHeader, requestID, idempotencyKey string
+	var gotHeader, targetAuthorization, requestID, idempotencyKey string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotHeader = r.Header.Get("X-Kokoro-Scheduler-Job")
+		targetAuthorization = r.Header.Get("Authorization")
 		requestID = r.Header.Get("X-Request-Id")
 		idempotencyKey = r.Header.Get("Idempotency-Key")
 		w.WriteHeader(http.StatusAccepted)
@@ -77,11 +78,29 @@ func TestHTTPJobRunnerDispatchesWithTimeoutAndHeader(t *testing.T) {
 	defer srv.Close()
 	job := Job{Name: "billing.reconcile", Schedule: "@every 1m", URL: srv.URL, Method: http.MethodPost, Body: map[string]any{"tenantId": "TENANT"}}
 	result := NewHTTPRunner(2*time.Second).RunAt(context.Background(), job, time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC))
-	if result.Err != nil || result.Status != http.StatusAccepted || gotHeader != job.Name || requestID == "" || idempotencyKey == "" {
-		t.Fatalf("unexpected result: %#v job=%q request_id=%q idempotency_key=%q", result, gotHeader, requestID, idempotencyKey)
+	if result.Err != nil || result.Status != http.StatusAccepted || gotHeader != job.Name || targetAuthorization != "" || requestID == "" || idempotencyKey == "" {
+		t.Fatalf("unexpected result: %#v job=%q authorization=%q request_id=%q idempotency_key=%q", result, gotHeader, targetAuthorization, requestID, idempotencyKey)
 	}
 	if requestID != "sched_billing.reconcile_20260102T030405Z" || idempotencyKey != "schedule:billing.reconcile:20260102T030405Z" {
 		t.Fatalf("unexpected request identity: request_id=%q idempotency_key=%q", requestID, idempotencyKey)
+	}
+}
+
+func TestHTTPJobRunnerAddsOptionalTargetServiceAuthorization(t *testing.T) {
+	var authorization string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	job := Job{Name: "billing.reconcile", Schedule: "@every 1m", URL: srv.URL, Method: http.MethodPost, Body: map[string]any{}}
+	result := NewHTTPRunner(2*time.Second, " target-service-token ").RunAt(context.Background(), job, time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC))
+	if result.Err != nil || result.Status != http.StatusAccepted {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	if authorization != "Bearer target-service-token" {
+		t.Fatalf("authorization = %q, want Bearer target-service-token", authorization)
 	}
 }
 

@@ -166,6 +166,19 @@ X-Request-Id: sched_<name>_<UTC timestamp>
 Idempotency-Key: schedule:<name>:<UTC timestamp>
 ```
 
+When `SCHEDULER_TARGET_SERVICE_TOKEN` is non-empty, every outbound dispatch also
+includes the following target-service authentication header:
+
+```http
+Authorization: Bearer <SCHEDULER_TARGET_SERVICE_TOKEN>
+```
+
+When the variable is empty or unset, the `Authorization` header is omitted to
+preserve existing fixture compatibility. This outbound target credential is
+separate from `SCHEDULER_INTERNAL_SERVICE_TOKEN`, which authenticates BFF
+requests entering the scheduler command surface. The configured target token
+is reused across retries and is never included in scheduler logs.
+
 `X-Request-Id` identifies the delivery attempt. `Idempotency-Key` identifies
 the scheduled occurrence and is reused by a caller that replays that
 occurrence. The scheduler does not manufacture an end-user identity; the

@@ -69,6 +69,9 @@ kokoro-scheduler/
 - `SCHEDULER_HTTP_ADDR`：可选；HTTP server bind address，默认 `:8080`；
 - `SCHEDULER_INTERNAL_SERVICE_TOKEN`：internal job command 的 service token。未设置时进程仍可启动，
   但 command route 全部拒绝认证；生产环境必须注入；
+- `SCHEDULER_TARGET_SERVICE_TOKEN`：可选的 Scheduler → 目标服务凭据。非空时每次 HTTP dispatch
+  携带 `Authorization: Bearer <token>`；留空时不发送该 header，以保持现有 fixture 兼容。该
+  token 与 `SCHEDULER_INTERNAL_SERVICE_TOKEN` 独立，禁止写入日志；
 - 每个 job 必须包含 `name`、`schedule`、`url`；
 - `method` 只允许 `POST` 或 `PUT`，默认 `POST`；
 - `body` 默认为 `{}`；
@@ -102,6 +105,8 @@ URL 和 body 由部署环境负责注入，不在 scheduler 中硬编码任何�
 - Redis claim 只解决 scheduler 实例间的重复触发窗口，不是业务正确性存储；
 - 任务调用采用 at-least-once 触发语义：进程重启或网络失败可能导致业务端再次收到 command；
 - 业务 endpoint 必须使用自己的 Idempotency-Key/command receipt 保证重复调用无副作用；
+- 如果配置了 `SCHEDULER_TARGET_SERVICE_TOKEN`，目标服务必须在自己的边界校验该 Bearer
+  凭据；scheduler 不解析目标服务的业务身份或授权；
 - 2xx 为成功，其余 HTTP 状态码和网络错误为失败；
 - scheduler 只对网络错误、429 和 5xx 按 job retry policy 重试；不写业务状态、不把失败转换为成功；
 - `Pause(name)` / `Resume(name)` 控制后续 occurrence；已进入 running 的 dispatch 不被强行取消；
