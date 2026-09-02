@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -40,6 +41,11 @@ const (
 
 var jobNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 
+var (
+	ErrJobAlreadyExists = errors.New("scheduler job already exists")
+	ErrJobNotFound      = errors.New("scheduler job not found")
+)
+
 func LoadJobs(raw string) ([]Job, error) {
 	if strings.TrimSpace(raw) == "" {
 		return []Job{}, nil
@@ -50,6 +56,9 @@ func LoadJobs(raw string) ([]Job, error) {
 	if err := decoder.Decode(&jobs); err != nil {
 		return nil, fmt.Errorf("decode scheduler jobs: %w", err)
 	}
+	if jobs == nil {
+		return nil, errors.New("decode scheduler jobs: expected a JSON array")
+	}
 	var extra any
 	if err := decoder.Decode(&extra); err != io.EOF {
 		if err == nil {
@@ -59,45 +68,56 @@ func LoadJobs(raw string) ([]Job, error) {
 	}
 	seenNames := make(map[string]struct{}, len(jobs))
 	for i := range jobs {
-		if jobs[i].Name == "" || jobs[i].Schedule == "" || jobs[i].URL == "" {
-			return nil, fmt.Errorf("job %d requires name, schedule and url", i)
-		}
-		if !jobNamePattern.MatchString(jobs[i].Name) {
-			return nil, fmt.Errorf("job %q has invalid name", jobs[i].Name)
+		if err := normalizeJob(&jobs[i]); err != nil {
+			return nil, fmt.Errorf("job %d: %w", i, err)
 		}
 		if _, exists := seenNames[jobs[i].Name]; exists {
 			return nil, fmt.Errorf("duplicate job name %q", jobs[i].Name)
 		}
 		seenNames[jobs[i].Name] = struct{}{}
-		if _, err := cron.ParseStandard(jobs[i].Schedule); err != nil {
-			return nil, fmt.Errorf("job %q has invalid schedule: %w", jobs[i].Name, err)
-		}
-		if jobs[i].Method == "" {
-			jobs[i].Method = http.MethodPost
-		}
-		if jobs[i].Method != http.MethodPost && jobs[i].Method != http.MethodPut {
-			return nil, fmt.Errorf("job %q has unsupported method %q", jobs[i].Name, jobs[i].Method)
-		}
-		if jobs[i].Body == nil {
-			jobs[i].Body = map[string]any{}
-		}
-		if jobs[i].Retry.MaxAttempts == 0 {
-			jobs[i].Retry.MaxAttempts = 1
-		}
-		if jobs[i].Retry.MaxAttempts < 1 || jobs[i].Retry.MaxAttempts > 10 {
-			return nil, fmt.Errorf("job %q has invalid retry.max_attempts", jobs[i].Name)
-		}
-		if jobs[i].Retry.BackoffSeconds < 0 || jobs[i].Retry.BackoffSeconds > 3600 {
-			return nil, fmt.Errorf("job %q has invalid retry.backoff_seconds", jobs[i].Name)
-		}
-		if jobs[i].MisfirePolicy == "" {
-			jobs[i].MisfirePolicy = MisfireSkip
-		}
-		if jobs[i].MisfirePolicy != MisfireSkip && jobs[i].MisfirePolicy != MisfireFireOnce {
-			return nil, fmt.Errorf("job %q has invalid misfire_policy %q", jobs[i].Name, jobs[i].MisfirePolicy)
-		}
 	}
 	return jobs, nil
+}
+
+func normalizeJob(job *Job) error {
+	if job.Name == "" || job.Schedule == "" || job.URL == "" {
+		return errors.New("requires name, schedule and url")
+	}
+	if !jobNamePattern.MatchString(job.Name) {
+		return fmt.Errorf("%q has invalid name", job.Name)
+	}
+	if _, err := cron.ParseStandard(job.Schedule); err != nil {
+		return fmt.Errorf("%q has invalid schedule: %w", job.Name, err)
+	}
+	parsedURL, err := url.ParseRequestURI(job.URL)
+	if err != nil || parsedURL.Host == "" || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+		return fmt.Errorf("%q has invalid url", job.Name)
+	}
+	if job.Method == "" {
+		job.Method = http.MethodPost
+	}
+	if job.Method != http.MethodPost && job.Method != http.MethodPut {
+		return fmt.Errorf("%q has unsupported method %q", job.Name, job.Method)
+	}
+	if job.Body == nil {
+		job.Body = map[string]any{}
+	}
+	if job.Retry.MaxAttempts == 0 {
+		job.Retry.MaxAttempts = 1
+	}
+	if job.Retry.MaxAttempts < 1 || job.Retry.MaxAttempts > 10 {
+		return fmt.Errorf("%q has invalid retry.max_attempts", job.Name)
+	}
+	if job.Retry.BackoffSeconds < 0 || job.Retry.BackoffSeconds > 3600 {
+		return fmt.Errorf("%q has invalid retry.backoff_seconds", job.Name)
+	}
+	if job.MisfirePolicy == "" {
+		job.MisfirePolicy = MisfireSkip
+	}
+	if job.MisfirePolicy != MisfireSkip && job.MisfirePolicy != MisfireFireOnce {
+		return fmt.Errorf("%q has invalid misfire_policy %q", job.Name, job.MisfirePolicy)
+	}
+	return nil
 }
 
 type RunResult struct {
@@ -203,6 +223,8 @@ type Service struct {
 	logger func(Job, RunResult)
 	locker Locker
 	mu     sync.RWMutex
+	jobs   map[string]Job
+	entry  map[string]cron.EntryID
 	paused map[string]bool
 }
 
@@ -219,18 +241,80 @@ func NewService(runner Runner, logger func(Job, RunResult), lockers ...Locker) *
 		runner: runner,
 		logger: logger,
 		locker: locker,
+		jobs:   make(map[string]Job),
+		entry:  make(map[string]cron.EntryID),
 		paused: make(map[string]bool),
 	}
 }
 func (s *Service) Add(job Job) error {
+	if err := normalizeJob(&job); err != nil {
+		return err
+	}
 	s.mu.Lock()
-	s.paused[job.Name] = job.Paused
-	s.mu.Unlock()
-	_, err := s.cron.AddFunc(job.Schedule, func() {
+	defer s.mu.Unlock()
+	if _, exists := s.jobs[job.Name]; exists {
+		return ErrJobAlreadyExists
+	}
+	entryID, err := s.cron.AddFunc(job.Schedule, func() {
 		now := time.Now().UTC()
 		s.Trigger(job, now, now)
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	s.jobs[job.Name] = job
+	s.entry[job.Name] = entryID
+	s.paused[job.Name] = job.Paused
+	return nil
+}
+
+func (s *Service) Register(job Job) error { return s.Add(job) }
+
+func (s *Service) Update(job Job) error {
+	if err := normalizeJob(&job); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	oldEntry, exists := s.entry[job.Name]
+	if !exists {
+		return ErrJobNotFound
+	}
+	newEntry, err := s.cron.AddFunc(job.Schedule, func() {
+		now := time.Now().UTC()
+		s.Trigger(job, now, now)
+	})
+	if err != nil {
+		return err
+	}
+	s.cron.Remove(oldEntry)
+	s.jobs[job.Name] = job
+	s.entry[job.Name] = newEntry
+	s.paused[job.Name] = job.Paused
+	return nil
+}
+
+func (s *Service) Remove(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entryID, exists := s.entry[name]
+	if !exists {
+		return ErrJobNotFound
+	}
+	s.cron.Remove(entryID)
+	delete(s.jobs, name)
+	delete(s.entry, name)
+	delete(s.paused, name)
+	return nil
+}
+
+func (s *Service) Delete(name string) error { return s.Remove(name) }
+
+func (s *Service) Job(name string) (Job, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	job, exists := s.jobs[name]
+	return job, exists
 }
 
 // Trigger dispatches one occurrence. The explicit scheduledAt/observedAt
@@ -301,16 +385,30 @@ func retryable(result RunResult) bool {
 	return result.Status == 0 || result.Status == http.StatusTooManyRequests || result.Status >= 500
 }
 
-func (s *Service) Pause(name string) {
+func (s *Service) Pause(name string) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.jobs[name]; !exists {
+		return ErrJobNotFound
+	}
 	s.paused[name] = true
-	s.mu.Unlock()
+	job := s.jobs[name]
+	job.Paused = true
+	s.jobs[name] = job
+	return nil
 }
 
-func (s *Service) Resume(name string) {
+func (s *Service) Resume(name string) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.jobs[name]; !exists {
+		return ErrJobNotFound
+	}
 	s.paused[name] = false
-	s.mu.Unlock()
+	job := s.jobs[name]
+	job.Paused = false
+	s.jobs[name] = job
+	return nil
 }
 func (s *Service) Start()                                   { s.cron.Start() }
 func (s *Service) Stop(ctx context.Context) context.Context { return s.cron.Stop() }

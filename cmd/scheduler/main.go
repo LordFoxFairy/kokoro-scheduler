@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -41,11 +44,38 @@ func main() {
 		}
 	}
 	service.Start()
+
+	httpAddr := strings.TrimSpace(os.Getenv("SCHEDULER_HTTP_ADDR"))
+	if httpAddr == "" {
+		httpAddr = ":8080"
+	}
+	httpServer := &http.Server{
+		Addr:              httpAddr,
+		Handler:           scheduler.NewHTTPHandler(service, os.Getenv("SCHEDULER_INTERNAL_SERVICE_TOKEN")),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	httpErrors := make(chan error, 1)
+	go func() {
+		log.Printf("scheduler HTTP server listening addr=%s", httpAddr)
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			httpErrors <- err
+		}
+	}()
 	log.Printf("scheduler started jobs=%d", len(jobs))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	<-ctx.Done()
-	shutdown := service.Stop(ctx)
+	select {
+	case <-ctx.Done():
+	case err := <-httpErrors:
+		log.Printf("scheduler HTTP server failed: %v", err)
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("scheduler HTTP shutdown: %v", err)
+	}
+	shutdown := service.Stop(shutdownCtx)
 	<-shutdown.Done()
 	_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"stopped": true})
 }

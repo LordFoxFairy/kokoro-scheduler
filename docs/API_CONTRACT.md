@@ -2,11 +2,12 @@
 
 ## 1. Boundary
 
-`kokoro-scheduler` is a Go infrastructure service. Its v1 runtime input is
-the deployment-owned `SCHEDULER_JOBS_JSON` document; it does not expose a
-business CRUD API and it does not read Billing, Credit, Agent, or any other
-business database. A business repository owns the command endpoint and its
-business response/error code.
+`kokoro-scheduler` is a Go infrastructure service. Its v1 runtime inputs are
+the deployment-owned `SCHEDULER_JOBS_JSON` document and the internal job
+command surface below. The internal surface registers generic `ScheduleJob`
+definitions only; it is not a business `ScheduledTask` CRUD API and it does
+not read Billing, Credit, Agent, or any other business database. A business
+repository owns the command endpoint and its business response/error code.
 
 The scheduler may use Redis for a distributed occurrence lease. PostgreSQL is
 the platform persistence baseline for business repositories; this scheduler
@@ -17,12 +18,96 @@ truth.
 If `SCHEDULER_JOBS_JSON` is unset, empty, or contains only whitespace, it is
 treated as an empty job list (`[]`).
 
-Because v1 has no public resource CRUD endpoint, cursor pagination, OAuth
-tokens, SSE stream, or user-facing response envelope are not scheduler
-surfaces. The target business command owns those concerns; scheduler-side
-receipts are callback/log records with the fields defined below.
+The scheduler has no public resource CRUD endpoint, cursor pagination, OAuth
+user surface, SSE stream, or user-facing API. The target business command owns
+those concerns; scheduler-side receipts are callback/log records with the
+fields defined below.
 
-## 2. ScheduleJob configuration resource
+## 2. Internal job command surface
+
+The BFF-to-Scheduler registration adapter uses these routes:
+
+```text
+POST   /internal/scheduler/v1/jobs/{name}          register
+PUT    /internal/scheduler/v1/jobs/{name}          replace/update
+DELETE /internal/scheduler/v1/jobs/{name}          remove
+POST   /internal/scheduler/v1/jobs/{name}/pause    pause future occurrences
+POST   /internal/scheduler/v1/jobs/{name}/resume   resume future occurrences
+```
+
+`{name}` must match `[a-z0-9][a-z0-9._-]{0,63}`. The routes are internal
+only and are not exposed through the public BFF user API.
+
+### Authentication and request metadata
+
+Every command request must include:
+
+```http
+Authorization: Bearer <SCHEDULER_INTERNAL_SERVICE_TOKEN>
+X-Request-Id: <request-id>
+Idempotency-Key: <mutation-key>
+```
+
+The service token is configured with `SCHEDULER_INTERNAL_SERVICE_TOKEN` and is
+compared in constant time. For compatibility with existing Kokoro internal
+transport adapters, the same token is also accepted in
+`X-Kokoro-Service-Token` or `X-Kokoro-Internal-Secret`; deployments should use
+the `Authorization` form for this API. `X-Kokoro-Request-Id` is accepted as a
+transport-compatible alias when `X-Request-Id` is absent.
+
+Missing or invalid authentication returns `401 service_auth_failed`.
+Missing request IDs return `400 request_id_required`; missing idempotency keys
+return `400 idempotency_key_required`. A successful or failed command response
+contains the request ID in `meta.request_id` and the `X-Request-Id` response
+header; `X-Kokoro-Request-Id` is emitted as the transport-compatible response
+alias.
+
+### JSON and mutation semantics
+
+`POST` and `PUT` require `Content-Type: application/json` and one JSON object.
+Unknown or duplicate fields, `null` fields, malformed JSON, trailing JSON
+values, invalid types, invalid URLs, invalid cron expressions, and a body name
+that differs from `{name}` return `400 invalid_job`. The `name` field may be
+omitted from the body because it is supplied by the path; when present it must
+match.
+
+`DELETE` accepts no body or `{}`. Pause and resume accept no body or `{}`.
+Non-empty bodies on those operations must also be strict JSON objects. All
+mutations require an idempotency key. The idempotency scope is method, path,
+and key. Within one process, the same key and normalized JSON payload replay
+the exact original response; the same key with a different payload returns
+`409 idempotency_conflict`.
+
+- `POST` registers only a new job. A different key for an existing job returns
+  `409 job_already_exists`; it never silently updates the job.
+- `PUT` updates only an existing job and returns `404 job_not_found` when the
+  job is absent.
+- `DELETE` removes an existing job and returns `404 job_not_found` when it is
+  already absent under a new idempotency key. Replays use the original result.
+- Pause/resume return `404 job_not_found` for an absent job and affect future
+  occurrences only; an in-flight dispatch is not cancelled.
+
+Successful responses use `200` and the following shape:
+
+```json
+{
+  "data": { "job": { "name": "billing.reconcile" }, "status": "registered" },
+  "meta": { "request_id": "req_scheduler_register_1" }
+}
+```
+
+The delete response uses `data.name` and `data.status: "deleted"`; pause and
+resume use `data.name` and `data.paused`.
+
+`/healthz` and `/readyz` remain unauthenticated `GET` probes. Readiness does
+not require a business database; Redis remains an optional coordination
+dependency.
+
+The command registry and idempotency receipts are process-local memory. They
+are intentionally not a database or a durable `ScheduledTask` store. BFF or
+deployment orchestration must replay registrations after a scheduler restart.
+
+## 3. ScheduleJob configuration resource
 
 The JSON array contains `ScheduleJob` resources:
 
@@ -41,7 +126,7 @@ The JSON array contains `ScheduleJob` resources:
 Unknown fields, duplicate names, invalid URLs/methods, and invalid cron
 expressions fail startup before any job is registered.
 
-## 3. State machines
+## 4. State machines
 
 ### ScheduleJob
 
@@ -70,7 +155,7 @@ prevents duplicate dispatch across scheduler instances; it is not a durable
 execution receipt. The command endpoint must persist its own idempotency receipt
 in PostgreSQL when business truth is required.
 
-## 4. Dispatch contract
+## 5. Dispatch contract
 
 Every HTTP dispatch is JSON and includes:
 
@@ -105,7 +190,7 @@ error categories are:
 | `SCHEDULER_TARGET_REJECTED` | Target returned a non-success HTTP response |
 | `SCHEDULER_MISFIRED` | Recovery trigger was discarded by `misfire_policy=skip` |
 
-## 5. Verification
+## 6. Verification
 
 ```bash
 gofmt -l .
