@@ -150,10 +150,13 @@ pending --misfire=fire_once--> claimed
 ```
 
 Redis claim keys are
-`kokoro:scheduler:run:<name>:<occurrence>` with a 26-hour TTL. The lease
-prevents duplicate dispatch across scheduler instances; it is not a durable
-execution receipt. The command endpoint must persist its own idempotency receipt
-in PostgreSQL when business truth is required.
+`kokoro:scheduler:run:<name>:<occurrence>` with a 26-hour TTL. The scheduler
+keeps a successful claim until that TTL expires; releasing it immediately after
+dispatch would allow another scheduler instance to execute the same occurrence
+again. The lease prevents duplicate dispatch across scheduler instances during
+the deduplication window; it is not a durable execution receipt. The command
+endpoint must persist its own idempotency receipt in PostgreSQL when business
+truth is required.
 
 ## 5. Dispatch contract
 

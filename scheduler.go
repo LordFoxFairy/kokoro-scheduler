@@ -190,7 +190,9 @@ type Runner interface {
 }
 
 // Locker is optional. A nil locker is the supported single-replica mode.
-// In multi-replica mode it provides a per-occurrence distributed claim.
+// In multi-replica mode it provides a per-occurrence distributed claim. The
+// release function is available to callers that need an explicit early
+// release; Service retains its occurrence claim until the lease TTL expires.
 type Locker interface {
 	Acquire(context.Context, string, time.Duration) (release func(), acquired bool, err error)
 }
@@ -359,7 +361,9 @@ func (s *Service) run(job Job, now time.Time) {
 	}
 	ctx := context.Background()
 	if s.locker != nil {
-		release, acquired, err := s.locker.Acquire(ctx, OccurrenceKey(job, now), 26*time.Hour)
+		// Keep the claim until its TTL expires. Releasing it after a successful
+		// dispatch would let another replica execute the same occurrence again.
+		_, acquired, err := s.locker.Acquire(ctx, OccurrenceKey(job, now), 26*time.Hour)
 		if err != nil || !acquired {
 			if err != nil {
 				requestID, idempotencyKey := RequestIdentity(job, now)
@@ -367,7 +371,6 @@ func (s *Service) run(job Job, now time.Time) {
 			}
 			return
 		}
-		defer release()
 	}
 	result := RunResult{}
 	maxAttempts := job.Retry.MaxAttempts

@@ -79,7 +79,7 @@ kokoro-scheduler/
 - 未知字段、空字段、非法 cron 表达式在启动阶段失败；
 - 调度时区固定为 UTC；
 - HTTP 超时固定为 30 秒。
-- 使用 Redis 时，以 `kokoro:scheduler:run:<job>:<occurrence>` 做 `SET NX` claim，TTL 为 26 小时；token 校验后释放锁。
+- 使用 Redis 时，以 `kokoro:scheduler:run:<job>:<occurrence>` 做 `SET NX` claim，TTL 为 26 小时；dispatch 完成后保留 claim 直到 TTL 到期，避免同一 occurrence 在另一实例上再次执行。lease 不是业务执行事实。
 
 示例：
 
@@ -102,7 +102,7 @@ URL 和 body 由部署环境负责注入，不在 scheduler 中硬编码任何�
 - 启动顺序：解析 JSON → 注册全部 cron job → 任一 job 非法则进程退出 → 启动 cron 和 HTTP server；
 - 每个任务使用 `SkipIfStillRunning`，避免单实例同一任务重叠执行；
 - 单副本不需要 Redis；多副本必须配置 `SCHEDULER_REDIS_URL`，各实例仍使用同一 UTC occurrence key 竞争 claim；
-- Redis claim 只解决 scheduler 实例间的重复触发窗口，不是业务正确性存储；
+- Redis claim 只解决 scheduler 实例间的重复触发窗口，不是业务正确性存储；成功 dispatch 后不能立即释放 claim，否则同一 occurrence 可能再次触发；
 - 任务调用采用 at-least-once 触发语义：进程重启或网络失败可能导致业务端再次收到 command；
 - 业务 endpoint 必须使用自己的 Idempotency-Key/command receipt 保证重复调用无副作用；
 - 如果配置了 `SCHEDULER_TARGET_SERVICE_TOKEN`，目标服务必须在自己的边界校验该 Bearer

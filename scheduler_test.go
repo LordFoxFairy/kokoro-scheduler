@@ -232,6 +232,21 @@ func TestServiceDoesNotRunTheSameOccurrenceTwiceAcrossInstances(t *testing.T) {
 	}
 }
 
+func TestServiceKeepsOccurrenceClaimAfterDispatch(t *testing.T) {
+	locker := &testLocker{}
+	runner := &testRunner{}
+	service := NewService(runner, func(Job, RunResult) {}, locker)
+	job := Job{Name: "job", Schedule: "@every 1m", URL: "http://service.test"}
+	at := time.Unix(100, 0)
+
+	service.run(job, at)
+	service.run(job, at)
+
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want one dispatch for one occurrence", runner.calls)
+	}
+}
+
 func TestOccurrenceKeySupportsSubsecondEverySchedules(t *testing.T) {
 	job := Job{Name: "fast", Schedule: "@every 500ms"}
 	first := OccurrenceKey(job, time.Unix(10, 0))
