@@ -17,7 +17,9 @@ surface 注册给 `kokoro-scheduler`。
   Scheduler 在进程内对相同 method/path/key 和相同规范化 JSON payload 重放原响应，
   对 payload 冲突返回 `409 idempotency_conflict`。
 - Scheduler 只向内部 command endpoint 发起 `POST`/`PUT` JSON 请求，并携带
-  `X-Request-Id`、`Idempotency-Key` 和 `X-Kokoro-Scheduler-Job`。配置非空的
+  `X-Kokoro-Scheduler-Job`、规范化 UTC occurrence 的 `X-Kokoro-Scheduler-Occurrence`、
+  `X-Request-Id` 和 `Idempotency-Key`。`X-Kokoro-Scheduler-Occurrence` 对同一 occurrence
+  的重试保持稳定。配置非空的
   `SCHEDULER_TARGET_SERVICE_TOKEN` 后，还会携带 `Authorization: Bearer <token>`；目标 BFF
   command 必须在自己的 HTTP 边界校验该凭据。留空时省略该 header，以兼容现有 fixture。
 - Billing、Capability、Storage 等业务仓库在自己的 PostgreSQL 中保存幂等 receipt、

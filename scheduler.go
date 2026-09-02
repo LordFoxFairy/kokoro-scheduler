@@ -129,6 +129,8 @@ type RunResult struct {
 	IdempotencyKey string
 }
 
+const occurrenceHeader = "X-Kokoro-Scheduler-Occurrence"
+
 type HTTPRunner struct {
 	client             *http.Client
 	targetServiceToken string
@@ -160,6 +162,7 @@ func (r *HTTPRunner) RunAt(ctx context.Context, job Job, at time.Time) RunResult
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-Kokoro-Scheduler-Job", job.Name)
+	request.Header.Set(occurrenceHeader, OccurrenceIdentity(at))
 	request.Header.Set("X-Request-Id", requestID)
 	request.Header.Set("Idempotency-Key", idempotencyKey)
 	if r.targetServiceToken != "" {
@@ -225,9 +228,14 @@ func OccurrenceKey(job Job, now time.Time) string {
 // dispatch. Callers use the same occurrence timestamp when they need to
 // replay a delivery without creating a second business operation.
 func RequestIdentity(job Job, at time.Time) (requestID string, idempotencyKey string) {
-	at = at.UTC()
-	occurrence := at.Format("20060102T150405Z")
+	occurrence := OccurrenceIdentity(at)
 	return fmt.Sprintf("sched_%s_%s", job.Name, occurrence), fmt.Sprintf("schedule:%s:%s", job.Name, occurrence)
+}
+
+// OccurrenceIdentity returns the canonical UTC timestamp used to identify one
+// scheduled occurrence in outbound dispatch metadata.
+func OccurrenceIdentity(at time.Time) string {
+	return at.UTC().Format("20060102T150405Z")
 }
 
 type Service struct {

@@ -67,10 +67,11 @@ func TestLoadJobsParsesRetryPauseAndMisfirePolicy(t *testing.T) {
 }
 
 func TestHTTPJobRunnerDispatchesWithTimeoutAndHeader(t *testing.T) {
-	var gotHeader, targetAuthorization, requestID, idempotencyKey string
+	var gotHeader, targetAuthorization, occurrence, requestID, idempotencyKey string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotHeader = r.Header.Get("X-Kokoro-Scheduler-Job")
 		targetAuthorization = r.Header.Get("Authorization")
+		occurrence = r.Header.Get("X-Kokoro-Scheduler-Occurrence")
 		requestID = r.Header.Get("X-Request-Id")
 		idempotencyKey = r.Header.Get("Idempotency-Key")
 		w.WriteHeader(http.StatusAccepted)
@@ -78,8 +79,8 @@ func TestHTTPJobRunnerDispatchesWithTimeoutAndHeader(t *testing.T) {
 	defer srv.Close()
 	job := Job{Name: "billing.reconcile", Schedule: "@every 1m", URL: srv.URL, Method: http.MethodPost, Body: map[string]any{"tenantId": "TENANT"}}
 	result := NewHTTPRunner(2*time.Second).RunAt(context.Background(), job, time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC))
-	if result.Err != nil || result.Status != http.StatusAccepted || gotHeader != job.Name || targetAuthorization != "" || requestID == "" || idempotencyKey == "" {
-		t.Fatalf("unexpected result: %#v job=%q authorization=%q request_id=%q idempotency_key=%q", result, gotHeader, targetAuthorization, requestID, idempotencyKey)
+	if result.Err != nil || result.Status != http.StatusAccepted || gotHeader != job.Name || targetAuthorization != "" || occurrence != "20260102T030405Z" || requestID == "" || idempotencyKey == "" {
+		t.Fatalf("unexpected result: %#v job=%q authorization=%q occurrence=%q request_id=%q idempotency_key=%q", result, gotHeader, targetAuthorization, occurrence, requestID, idempotencyKey)
 	}
 	if requestID != "sched_billing.reconcile_20260102T030405Z" || idempotencyKey != "schedule:billing.reconcile:20260102T030405Z" {
 		t.Fatalf("unexpected request identity: request_id=%q idempotency_key=%q", requestID, idempotencyKey)
@@ -131,6 +132,13 @@ func TestRequestIdentityIsStableForAnOccurrence(t *testing.T) {
 	requestIDAgain, idempotencyKeyAgain := RequestIdentity(job, at)
 	if requestIDAgain != requestID || idempotencyKeyAgain != idempotencyKey {
 		t.Fatal("request identity must be deterministic for the same occurrence")
+	}
+}
+
+func TestOccurrenceIdentityNormalizesToUTC(t *testing.T) {
+	at := time.Date(2026, 1, 2, 3, 4, 5, 900_000_000, time.FixedZone("fixture", -5*60*60))
+	if got, want := OccurrenceIdentity(at), "20260102T080405Z"; got != want {
+		t.Fatalf("occurrence identity = %q, want %q", got, want)
 	}
 }
 

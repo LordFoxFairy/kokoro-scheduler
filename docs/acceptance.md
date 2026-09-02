@@ -21,7 +21,7 @@ go build ./cmd/scheduler
 | internal 重复语义 | 同 key 重放、同 key 改 payload、不同 key 重复 POST | 原响应 replay、`409 idempotency_conflict`、`409 job_already_exists` |
 | internal 严格边界 | 未知字段、null、错误类型、trailing JSON、错误 Content-Type | 请求被拒绝且返回 request_id |
 | internal pause/resume | `/pause`、`/resume` | 复用 Service 控制后续 occurrence，不取消 in-flight dispatch |
-| 成功 dispatch | HTTP Mock 返回 2xx | `succeeded`，含 request/idempotency metadata |
+| 成功 dispatch | HTTP Mock 返回 2xx | `succeeded`，含 occurrence、request 和 idempotency metadata |
 | 目标服务认证 | HTTP dispatch mock + `SCHEDULER_TARGET_SERVICE_TOKEN` | 配置非空时发送 `Authorization: Bearer <token>`；留空时省略该 header |
 | 目标失败 | Mock 返回 4xx/5xx 或网络错误 | 正确分类，按策略仅重试可重试失败 |
 | pause/resume | Service control fixture | pause 跳过后续 occurrence，resume 恢复 |

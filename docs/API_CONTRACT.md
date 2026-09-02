@@ -162,6 +162,7 @@ Every HTTP dispatch is JSON and includes:
 ```http
 Content-Type: application/json
 X-Kokoro-Scheduler-Job: <name>
+X-Kokoro-Scheduler-Occurrence: <YYYYMMDDTHHMMSSZ>
 X-Request-Id: sched_<name>_<UTC timestamp>
 Idempotency-Key: schedule:<name>:<UTC timestamp>
 ```
@@ -179,11 +180,14 @@ separate from `SCHEDULER_INTERNAL_SERVICE_TOKEN`, which authenticates BFF
 requests entering the scheduler command surface. The configured target token
 is reused across retries and is never included in scheduler logs.
 
-`X-Request-Id` identifies the delivery attempt. `Idempotency-Key` identifies
-the scheduled occurrence and is reused by a caller that replays that
-occurrence. The scheduler does not manufacture an end-user identity; the
-target service validates the trusted service context and its own authorization
-boundary.
+`X-Kokoro-Scheduler-Occurrence` is the stable occurrence identity, formatted
+as the scheduled occurrence timestamp in UTC (`YYYYMMDDTHHMMSSZ`). It is
+derived from the occurrence time supplied to the HTTP runner and is stable for
+retries of the same occurrence. `X-Request-Id` identifies the delivery attempt.
+`Idempotency-Key` identifies the scheduled occurrence and is reused by a caller
+that replays that occurrence. The scheduler does not manufacture an end-user
+identity; the target service validates the trusted service context and its own
+authorization boundary.
 
 Only 2xx is success. Network errors, HTTP 429, and HTTP 5xx are retryable when
 the configured attempt budget remains. Other 4xx responses fail immediately.
@@ -213,5 +217,5 @@ go build ./cmd/scheduler
 ```
 
 The contract tests cover strict configuration parsing, retry policy,
-pause/resume, request identity, HTTP headers, occurrence lease behavior, and
-success/failure classification.
+pause/resume, request identity, normalized occurrence identity and HTTP
+headers, occurrence lease behavior, and success/failure classification.

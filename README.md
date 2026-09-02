@@ -18,7 +18,14 @@ BFF 可通过受保护的 internal HTTP command surface 注册、更新、暂停
 ```
 
 每个任务由 `name/schedule/url/method/body/retry/misfire_policy/paused` 组成；配置使用严格 JSON 解码，未知字段和非法 cron 表达式会在启动时失败。
-HTTP 调用默认 30 秒超时，携带 `X-Request-Id` 和按 occurrence 稳定的 `Idempotency-Key`。配置非空的 `SCHEDULER_TARGET_SERVICE_TOKEN` 后，scheduler 会为每次出站 dispatch 增加 `Authorization: Bearer <token>`；留空时不发送该 header，以保持现有 fixture 兼容。该 token 是 Scheduler → 目标服务凭据，与 BFF → Scheduler 使用的 `SCHEDULER_INTERNAL_SERVICE_TOKEN` 独立。网络错误、429 和 5xx 按 retry policy 重试；目标业务服务负责持久化幂等 receipt 和业务状态。单实例不需要 Redis；多实例请配置 `SCHEDULER_REDIS_URL`，用于同一 occurrence 的跨实例 claim。
+HTTP 调用默认 30 秒超时，携带 `X-Kokoro-Scheduler-Job`、规范化 UTC occurrence 的
+`X-Kokoro-Scheduler-Occurrence`、`X-Request-Id` 和按 occurrence 稳定的
+`Idempotency-Key`。配置非空的 `SCHEDULER_TARGET_SERVICE_TOKEN` 后，scheduler 会为每次出站
+dispatch 增加 `Authorization: Bearer <token>`；留空时不发送该 header，以保持现有 fixture
+兼容。该 token 是 Scheduler → 目标服务凭据，与 BFF → Scheduler 使用的
+`SCHEDULER_INTERNAL_SERVICE_TOKEN` 独立。网络错误、429 和 5xx 按 retry policy 重试；目标业务
+服务负责持久化幂等 receipt 和业务状态。单实例不需要 Redis；多实例请配置
+`SCHEDULER_REDIS_URL`，用于同一 occurrence 的跨实例 claim。
 
 完整契约见：[API_CONTRACT.md](docs/API_CONTRACT.md)。
 

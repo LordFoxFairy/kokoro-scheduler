@@ -23,7 +23,7 @@
 - 进程内通用 `ScheduleJob` registry，以及 BFF command 的重复注册/更新/删除语义；
 - internal service token、严格 JSON、request ID 和 mutation idempotency 边界；
 - 单实例任务运行控制；同一任务仍在执行时跳过下一次触发；
-- HTTP method、URL、JSON body、超时和基础结果日志；
+- HTTP method、URL、JSON body、超时、occurrence identity header 和基础结果日志；
 - scheduler 进程生命周期。
 
 ### doesNotOwn
