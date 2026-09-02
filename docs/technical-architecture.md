@@ -58,7 +58,7 @@ kokoro-scheduler/
 
 环境变量：
 
-- `SCHEDULER_JOBS_JSON`：必需时为 JSON 数组；未设置或空值表示零任务；
+- `SCHEDULER_JOBS_JSON`：必需时为 JSON 数组；未设置、空字符串或仅空白值表示零任务；
 - `SCHEDULER_REDIS_URL`：可选；单副本留空，多副本必须配置。配置后启动时会 Ping Redis，连接失败则进程退出；
 - 每个 job 必须包含 `name`、`schedule`、`url`；
 - `method` 只允许 `POST` 或 `PUT`，默认 `POST`；

@@ -8,6 +8,18 @@ import (
 	"time"
 )
 
+func TestLoadJobsTreatsEmptyConfigAsNoJobs(t *testing.T) {
+	for _, raw := range []string{"", " \n\t  "} {
+		jobs, err := LoadJobs(raw)
+		if err != nil {
+			t.Fatalf("LoadJobs(%q) returned error: %v", raw, err)
+		}
+		if jobs == nil || len(jobs) != 0 {
+			t.Fatalf("LoadJobs(%q) = %#v, want a non-nil empty jobs list", raw, jobs)
+		}
+	}
+}
+
 func TestLoadJobsUsesCronSpecAndRejectsUnknownFields(t *testing.T) {
 	jobs, err := LoadJobs(`[ {"name":"billing.reconcile","schedule":"@every 1m","url":"http://service.test/command","method":"POST","body":{"tenantId":"TENANT"}} ]`)
 	if err != nil {

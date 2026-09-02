@@ -11,7 +11,7 @@ go run ./cmd/scheduler
 
 ## 配置
 
-- `SCHEDULER_JOBS_JSON`：严格 JSON 数组；为空时以零任务启动。
+- `SCHEDULER_JOBS_JSON`：严格 JSON 数组；未设置、空字符串或仅空白值时以零任务启动。
 - `SCHEDULER_REDIS_URL`：多实例时配置共享 Redis，用于 occurrence lease；单实例可省略。
 
 Job 的完整字段和 retry/misfire 规则见 [API_CONTRACT.md](./API_CONTRACT.md)。

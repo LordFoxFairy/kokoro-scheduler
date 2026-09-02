@@ -14,6 +14,9 @@ remains configuration-driven in v1 and therefore has no PostgreSQL schema.
 Redis is coordination only and is never the source of billing or execution
 truth.
 
+If `SCHEDULER_JOBS_JSON` is unset, empty, or contains only whitespace, it is
+treated as an empty job list (`[]`).
+
 Because v1 has no public resource CRUD endpoint, cursor pagination, OAuth
 tokens, SSE stream, or user-facing response envelope are not scheduler
 surfaces. The target business command owns those concerns; scheduler-side

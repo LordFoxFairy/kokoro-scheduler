@@ -41,6 +41,9 @@ const (
 var jobNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 
 func LoadJobs(raw string) ([]Job, error) {
+	if strings.TrimSpace(raw) == "" {
+		return []Job{}, nil
+	}
 	var jobs []Job
 	decoder := json.NewDecoder(bytes.NewBufferString(raw))
 	decoder.DisallowUnknownFields()

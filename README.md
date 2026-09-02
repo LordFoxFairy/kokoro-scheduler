@@ -7,6 +7,8 @@
 调度核心直接复用成熟的 [`robfig/cron/v3`](https://github.com/robfig/cron)，支持标准 cron 表达式和 `@every`。
 任务由 `SCHEDULER_JOBS_JSON` 注入：
 
+未设置、空字符串或仅包含空白字符的值均按空任务列表处理；也可以显式配置 `[]`。
+
 ```json
 [{"name":"billing.reconcile","schedule":"@every 1h","url":"http://service.internal/commands/reconcile","method":"POST","body":{"tenantId":"TENANT"}}]
 ```
