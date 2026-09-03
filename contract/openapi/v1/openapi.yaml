@@ -1,0 +1,369 @@
+openapi: 3.1.0
+info:
+  title: Kokoro Scheduler Internal API
+  version: 1.0.0
+servers:
+  - url: /
+paths:
+  /healthz:
+    get:
+      operationId: health
+      responses:
+        "200":
+          description: Process is alive.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProbeResponse"
+  /readyz:
+    get:
+      operationId: readiness
+      responses:
+        "200":
+          description: Scheduler and configured coordination dependency are ready.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProbeResponse"
+        "503":
+          $ref: "#/components/responses/Error"
+  /internal/scheduler/v1/jobs/{name}:
+    parameters:
+      - $ref: "#/components/parameters/JobName"
+      - $ref: "#/components/parameters/RequestId"
+      - $ref: "#/components/parameters/IdempotencyKey"
+    post:
+      operationId: registerJob
+      security:
+        - serviceBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JobInput"
+      responses:
+        "200":
+          $ref: "#/components/responses/JobMutation"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+    put:
+      operationId: updateJob
+      security:
+        - serviceBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JobInput"
+      responses:
+        "200":
+          $ref: "#/components/responses/JobMutation"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+    delete:
+      operationId: deleteJob
+      security:
+        - serviceBearer: []
+      responses:
+        "200":
+          description: Job was deleted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /internal/scheduler/v1/jobs/{name}/pause:
+    post:
+      operationId: pauseJob
+      security:
+        - serviceBearer: []
+      parameters:
+        - $ref: "#/components/parameters/JobName"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          $ref: "#/components/responses/PauseMutation"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /internal/scheduler/v1/jobs/{name}/resume:
+    post:
+      operationId: resumeJob
+      security:
+        - serviceBearer: []
+      parameters:
+        - $ref: "#/components/parameters/JobName"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          $ref: "#/components/responses/PauseMutation"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+components:
+  securitySchemes:
+    serviceBearer:
+      type: http
+      scheme: bearer
+  parameters:
+    JobName:
+      name: name
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^[a-z0-9][a-z0-9._-]{0,63}$"
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 256
+  responses:
+    Error:
+      description: Stable error envelope.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    JobMutation:
+      description: Job mutation completed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/JobMutationResponse"
+    PauseMutation:
+      description: Pause state changed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/PauseResponse"
+  schemas:
+    Meta:
+      type: object
+      additionalProperties: false
+      required:
+        - request_id
+      properties:
+        request_id:
+          type: string
+    RetryPolicy:
+      type: object
+      additionalProperties: false
+      properties:
+        max_attempts:
+          type: integer
+          minimum: 1
+          maximum: 10
+          default: 1
+        backoff_seconds:
+          type: integer
+          minimum: 1
+          maximum: 3600
+          default: 1
+        max_backoff_seconds:
+          type: integer
+          minimum: 1
+          maximum: 3600
+          default: 3600
+        max_retry_window_seconds:
+          type: integer
+          minimum: 1
+          maximum: 86400
+          default: 3600
+    JobInput:
+      type: object
+      additionalProperties: false
+      required:
+        - schedule
+        - url
+      properties:
+        name:
+          type: string
+        schedule:
+          type: string
+        url:
+          type: string
+          format: uri
+        method:
+          type: string
+          enum:
+            - POST
+            - PUT
+          default: POST
+        body:
+          type: object
+          default: {}
+        retry:
+          $ref: "#/components/schemas/RetryPolicy"
+        misfire_policy:
+          type: string
+          enum:
+            - skip
+            - fire_once
+          default: skip
+        paused:
+          type: boolean
+          default: false
+    Job:
+      allOf:
+        - $ref: "#/components/schemas/JobInput"
+        - type: object
+          required:
+            - name
+            - method
+            - body
+            - retry
+            - misfire_policy
+            - paused
+    ProbeData:
+      type: object
+      additionalProperties: false
+      required:
+        - service
+        - status
+      properties:
+        service:
+          type: string
+          const: kokoro-scheduler
+        status:
+          type: string
+          const: ok
+    ProbeResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+        - meta
+      properties:
+        data:
+          $ref: "#/components/schemas/ProbeData"
+        meta:
+          $ref: "#/components/schemas/Meta"
+    JobMutationData:
+      type: object
+      additionalProperties: false
+      required:
+        - job
+        - status
+      properties:
+        job:
+          $ref: "#/components/schemas/Job"
+        status:
+          type: string
+          enum:
+            - registered
+            - updated
+    JobMutationResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+        - meta
+      properties:
+        data:
+          $ref: "#/components/schemas/JobMutationData"
+        meta:
+          $ref: "#/components/schemas/Meta"
+    StatusData:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - status
+      properties:
+        name:
+          type: string
+        status:
+          type: string
+          const: deleted
+    StatusResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+        - meta
+      properties:
+        data:
+          $ref: "#/components/schemas/StatusData"
+        meta:
+          $ref: "#/components/schemas/Meta"
+    PauseData:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - paused
+      properties:
+        name:
+          type: string
+        paused:
+          type: boolean
+    PauseResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+        - meta
+      properties:
+        data:
+          $ref: "#/components/schemas/PauseData"
+        meta:
+          $ref: "#/components/schemas/Meta"
+    ErrorData:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - error
+        - meta
+      properties:
+        error:
+          $ref: "#/components/schemas/ErrorData"
+        meta:
+          $ref: "#/components/schemas/Meta"

@@ -50,7 +50,7 @@ Idempotency-Key: <mutation-key>
 
 The service token is configured with `SCHEDULER_INTERNAL_SERVICE_TOKEN` and is
 accepted only as a Bearer token in `Authorization`; it is compared in constant
-time. No legacy credential or request-id headers are accepted.
+time. Only the canonical credential and request-id headers are accepted.
 
 Missing or invalid authentication returns `401 service_auth_failed`.
 Missing request IDs return `400 request_id_required`; missing idempotency keys
@@ -96,8 +96,10 @@ The delete response uses `data.name` and `data.status: "deleted"`; pause and
 resume use `data.name` and `data.paused`.
 
 `/healthz` and `/readyz` remain unauthenticated `GET` probes. Readiness does
-not require a business database; Redis remains an optional coordination
-dependency.
+not require a business database. It verifies that scheduling has started and,
+when Redis coordination is configured, performs a deadline-bound Redis PING.
+Both probes use the same `data/meta.request_id` envelope as other successful
+responses; readiness failures use the standard error envelope and return 503.
 
 The command registry and idempotency receipts are process-local memory. They
 are intentionally not a database or a durable `ScheduledTask` store. BFF or
@@ -115,7 +117,9 @@ The JSON array contains `ScheduleJob` resources:
 | `method` | string | no | `POST` or `PUT`; default `POST` |
 | `body` | object | no | JSON command payload; default `{}` |
 | `retry.max_attempts` | integer | no | 1–10; default `1` |
-| `retry.backoff_seconds` | integer | no | 0–3600; exponential multiplier per attempt; default `0` |
+| `retry.backoff_seconds` | integer | no | 1–3600; initial exponential-backoff ceiling; default `1` |
+| `retry.max_backoff_seconds` | integer | no | 1–3600 and not less than `backoff_seconds`; per-delay ceiling; default `3600` |
+| `retry.max_retry_window_seconds` | integer | no | 1–86400; maximum interval in which another attempt may begin; default `3600` |
 | `misfire_policy` | string | no | `skip` or `fire_once`; default `skip` |
 | `paused` | boolean | no | Initial runtime state; default `false` |
 
@@ -173,9 +177,9 @@ includes the following target-service authentication header:
 Authorization: Bearer <SCHEDULER_TARGET_SERVICE_TOKEN>
 ```
 
-When the variable is empty or unset, the `Authorization` header is omitted to
-preserve existing fixture compatibility. This outbound target credential is
-separate from `SCHEDULER_INTERNAL_SERVICE_TOKEN`, which authenticates BFF
+When the variable is empty or unset, the `Authorization` header is omitted for
+targets whose contract does not require service authentication. This outbound
+target credential is separate from `SCHEDULER_INTERNAL_SERVICE_TOKEN`, which authenticates BFF
 requests entering the scheduler command surface. The configured target token
 is reused across retries and is never included in scheduler logs.
 
@@ -188,10 +192,30 @@ that replays that occurrence. The scheduler does not manufacture an end-user
 identity; the target service validates the trusted service context and its own
 authorization boundary.
 
+Every dispatch also carries a W3C `traceparent`. Its trace identifier is
+stable across retries of one occurrence; the attempt span identifier is
+derived separately. Structured JSON logs correlate `request_id`, `trace_id`,
+result, attempt count, and total duration without recording tokens or bodies.
+
 Only 2xx is success. Network errors, HTTP 429, and HTTP 5xx are retryable when
-the configured attempt budget remains. Other 4xx responses fail immediately.
-Backoff is `backoff_seconds * 2^(attempt-1)` and is bounded by the process
-context.
+both the configured attempt budget and retry window remain. Other 4xx
+responses fail immediately.
+
+After failed attempt `n`, the scheduler computes the full-jitter upper bound
+as:
+
+```text
+min(backoff_seconds * 2^(n-1), max_backoff_seconds, retry_window_remaining)
+```
+
+It then waits for a cryptographically random duration uniformly selected from
+zero through that upper bound. A fresh value is selected after every
+retryable failure so independently running scheduler instances do not retry in
+lockstep. The retry window starts immediately before the first target attempt;
+no later attempt starts at or after its deadline. An attempt already in
+progress remains subject to the 30-second dispatch timeout and process
+cancellation. Exhausting the attempt or time budget returns the last target
+result.
 
 The execution callback receives a `RunResult` containing `status`, `attempts`,
 `request_id`, `idempotency_key`, and an optional error. Standard scheduler
@@ -204,6 +228,7 @@ error categories are:
 | `SCHEDULER_TARGET_UNAVAILABLE` | Network-level target failure |
 | `SCHEDULER_TARGET_TIMEOUT` | Target request exceeded the HTTP timeout |
 | `SCHEDULER_TARGET_REJECTED` | Target returned a non-success HTTP response |
+| `SCHEDULER_RETRY_JITTER_UNAVAILABLE` | The process random source failed before a retry delay could be selected |
 | `SCHEDULER_MISFIRED` | Recovery trigger was discarded by `misfire_policy=skip` |
 
 ## 6. Verification
@@ -215,6 +240,7 @@ go vet ./...
 go build ./cmd/scheduler
 ```
 
-The contract tests cover strict configuration parsing, retry policy,
-pause/resume, request identity, normalized occurrence identity and HTTP
-headers, occurrence lease behavior, and success/failure classification.
+The contract tests cover strict configuration parsing, retry boundaries,
+capped exponential backoff, full jitter, the total retry window, pause/resume,
+request identity, normalized occurrence identity and HTTP headers, occurrence
+lease behavior, and success/failure classification.

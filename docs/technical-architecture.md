@@ -37,13 +37,20 @@
 
 ```text
 kokoro-scheduler/
-├── cmd/scheduler/main.go   # 唯一生产入口
-├── domain.go               # ScheduleJob value model and validation
-├── dispatch.go             # HTTP runner, Redis lease and occurrence identity
-├── service.go              # generic cron application service
-├── internal_http.go        # BFF internal command and health/readiness adapter
-├── scheduler_test.go       # scheduler unit/contract tests
-├── internal_http_test.go   # internal HTTP contract tests
+├── cmd/scheduler/main.go
+├── internal/
+│   ├── domain/              # Job、Occurrence、RetryPolicy 和领域不变量
+│   ├── application/         # 调度用例、lease、重试和 dispatch 编排
+│   ├── ports/               # Clock、ScheduleEngine、LeaseStore、TargetClient
+│   ├── adapters/
+│   │   ├── cron/             # robfig/cron implementation
+│   │   ├── httpclient/       # outbound HTTP implementation
+│   │   ├── redis/            # occurrence lease implementation
+│   │   └── system/           # context-aware timer and crypto random source
+│   ├── transport/http/       # internal command surface
+│   ├── config/               # env/config loading
+│   └── architecture/         # dependency-boundary tests
+├── test/doubles/             # only test doubles, never production imports
 ├── Dockerfile
 └── docs/
 ```
@@ -56,7 +63,7 @@ kokoro-scheduler/
 |---|---|
 | MySQL | 不依赖 |
 | MongoDB | 不依赖 |
-| Redis | 单副本不依赖；多副本必须配置，仅用于跨实例 occurrence claim |
+| Redis | 单副本不依赖；多副本可配置，仅用于跨实例 occurrence claim |
 | 外部库 | `github.com/robfig/cron/v3` |
 | HTTP | Go 标准库 `net/http` |
 
@@ -66,18 +73,23 @@ kokoro-scheduler/
 
 环境变量：
 
-- `SCHEDULER_JOBS_JSON`：必需时为 JSON 数组；未设置、空字符串或仅空白值表示零任务；
+- `SCHEDULER_JOBS_JSON`：可选 JSON 数组；未设置、空字符串或仅空白值表示零任务；
 - `SCHEDULER_REDIS_URL`：可选；单副本留空，多副本必须配置。配置后启动时会 Ping Redis，连接失败则进程退出；
 - `SCHEDULER_HTTP_ADDR`：可选；HTTP server bind address，默认 `:8080`；
+- `SCHEDULER_HEALTHCHECK_URL`：容器内置 healthcheck 使用的 readiness URL，默认
+  `http://127.0.0.1:8080/readyz`；
 - `SCHEDULER_INTERNAL_SERVICE_TOKEN`：internal job command 的 service token。未设置时进程仍可启动，
   但 command route 全部拒绝认证；生产环境必须注入；
 - `SCHEDULER_TARGET_SERVICE_TOKEN`：可选的 Scheduler → 目标服务凭据。非空时每次 HTTP dispatch
-  携带 `Authorization: Bearer <token>`；留空时不发送该 header，以保持现有 fixture 兼容。该
+  携带 `Authorization: Bearer <token>`；仅当目标服务契约不要求服务认证时才允许留空。该
   token 与 `SCHEDULER_INTERNAL_SERVICE_TOKEN` 独立，禁止写入日志；
 - 每个 job 必须包含 `name`、`schedule`、`url`；
 - `method` 只允许 `POST` 或 `PUT`，默认 `POST`；
 - `body` 默认为 `{}`；
 - `name` 必须是稳定的 `[a-z0-9][a-z0-9._-]{0,63}`，同一配置中不可重复；
+- `retry.max_attempts` 为 1–10，默认 1；`retry.backoff_seconds` 为 1–3600，默认 1；
+- `retry.max_backoff_seconds` 为 1–3600、不得小于初始 backoff，默认 3600；
+- `retry.max_retry_window_seconds` 为 1–86400，默认 3600；显式零值和越界值在注册前失败；
 - 未知字段、空字段、非法 cron 表达式在启动阶段失败；
 - 调度时区固定为 UTC；
 - HTTP 超时固定为 30 秒。
@@ -92,7 +104,7 @@ kokoro-scheduler/
     "schedule": "0 * * * *",
     "url": "http://service.internal/commands/reconcile",
     "method": "POST",
-    "body": {"tenantId": "TENANT"}
+    "body": {"tenant_id": "TENANT"}
   }
 ]
 ```
@@ -110,7 +122,12 @@ URL 和 body 由部署环境负责注入，不在 scheduler 中硬编码任何�
 - 如果配置了 `SCHEDULER_TARGET_SERVICE_TOKEN`，目标服务必须在自己的边界校验该 Bearer
   凭据；scheduler 不解析目标服务的业务身份或授权；
 - 2xx 为成功，其余 HTTP 状态码和网络错误为失败；
-- scheduler 只对网络错误、429 和 5xx 按 job retry policy 重试；不写业务状态、不把失败转换为成功；
+- scheduler 只对网络错误、429 和 5xx 按 job retry policy 重试；退避上限按
+  `min(backoff_seconds * 2^(attempt-1), max_backoff_seconds, 剩余重试窗口)` 计算，再使用加密随机源做
+  full jitter。每次失败独立取样，避免多实例同相位重试；总窗口从首次 target attempt 前开始，窗口
+  到期后不再启动下一次 attempt；
+- Clock、Sleeper 和随机源都经 port 注入，测试可确定性推进时间和 jitter 序列；生产使用系统时钟、
+  context-aware timer 和操作系统加密随机源；
 - `Pause(name)` / `Resume(name)` 控制后续 occurrence；已进入 running 的 dispatch 不被强行取消；
 - internal command registry 和 idempotency receipt 只在当前进程内存中存在；scheduler 重启后由 BFF 或部署编排重放注册，
   不把它们扩展为业务持久化；
@@ -136,15 +153,21 @@ URL 和 body 由部署环境负责注入，不在 scheduler 中硬编码任何�
 无论是否使用 Redis，被调用的 Billing command 都必须保持幂等。Redis 故障时启用了 coordination 的 scheduler 直接退出或跳过本次 claim，不在失去唯一性保证时继续执行。
 
 Scheduler 的健康与业务 command 的健康分离；scheduler 不以访问数据库作为 readiness 条件。
+`/healthz` 只表示进程存活；`/readyz` 检查 scheduler lifecycle，并在配置 Redis coordination 时执行
+deadline-bound PING。出站 command 注入 W3C `traceparent`；JSON 日志记录 `service`、`operation`、
+`request_id`、`trace_id`、`result`、`attempts` 与 `duration_ms`。
 
 ## 8. 验证证据
 
 ```bash
+gofmt -l .
 go test ./...
+go test -race ./...
 go vet ./...
 go build ./cmd/scheduler
 ```
 
 测试覆盖：严格配置和 command JSON 解析、未知字段拒绝、HTTP method/body、service token、request ID/idempotency
-headers、重复注册冲突与 replay、register/update/delete/pause/resume、retry policy、pause/resume、30 秒 client
-timeout、job header、2xx/非 2xx 结果及 cron service 注册。
+headers、重复注册冲突与 replay、register/update/delete/pause/resume、retry 边界、capped exponential
+backoff、full jitter、最大总窗口、pause/resume、30 秒 client timeout、job header、2xx/非 2xx 结果及
+cron service 注册。

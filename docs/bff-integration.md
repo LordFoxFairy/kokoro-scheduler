@@ -21,7 +21,7 @@ surface 注册给 `kokoro-scheduler`。
   `X-Request-Id` 和 `Idempotency-Key`。`X-Kokoro-Scheduler-Occurrence` 对同一 occurrence
   的重试保持稳定。配置非空的
   `SCHEDULER_TARGET_SERVICE_TOKEN` 后，还会携带 `Authorization: Bearer <token>`；目标 BFF
-  command 必须在自己的 HTTP 边界校验该凭据。留空时省略该 header，以兼容现有 fixture。
+  command 必须在自己的 HTTP 边界校验该凭据。仅当目标服务契约不要求服务认证时才允许留空。
 - Billing、Capability、Storage 等业务仓库在自己的 PostgreSQL 中保存幂等 receipt、
   状态和业务事件；Scheduler 的 Redis lease 只抑制多实例重复触发。
 - BFF 的 SSE、统一响应 envelope、公开分页和用户可见错误码仍由 BFF/业务仓库契约
@@ -36,6 +36,8 @@ surface 注册给 `kokoro-scheduler`。
    Scheduler 的 `meta.request_id` 纳入日志关联。
 4. 目标 command 使用 dispatch 的 `Idempotency-Key` 做数据库幂等处理。
 5. 目标 command 对重复、超时、429、5xx 具有可恢复语义。
+   Scheduler 使用带 `max_backoff_seconds` 和 `max_retry_window_seconds` 的 capped exponential
+   backoff + full jitter；BFF 注册适配器必须透传并校验这两个 retry 字段。
 6. `SCHEDULER_JOBS_JSON`、`SCHEDULER_INTERNAL_SERVICE_TOKEN` 和
    `SCHEDULER_TARGET_SERVICE_TOKEN` 仅由部署注入，不提交真实 token 或用户凭据。
 7. 联调先使用 Mock command，再执行目标仓库和 Scheduler 的独立启动验收；Scheduler
