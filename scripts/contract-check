@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+repository_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repository_dir"
+python3 -m json.tool contract/openapi/v1/openapi.yaml >/dev/null
+python3 -m json.tool contract/openapi/v1/breaking-policy.json >/dev/null
+python3 -m json.tool contract/manifest.json >/dev/null
+go test -count=1 ./test/contract ./internal/transport/http ./internal/adapters/httpclient

@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "owner": "kokoro-scheduler",
+  "visibility": "internal-owner",
+  "artifact": "contract/openapi/v1/openapi.yaml",
+  "contract_version": "1.0.0",
+  "source_sha256": "49be4429f9b1f4e86582c95aff770f6835629d3ea4ad80408bf65d0c64e598c3",
+  "source_of_truth": "owner-authored",
+  "generated": false,
+  "lint_parity_gate": "go test ./test/contract",
+  "breaking_policy": "contract/openapi/v1/breaking-policy.json",
+  "breaking_policy_sha256": "ffc18e3ee14513a66c6f5017f0a4b70b9833cd2d6a1d998f84428b7f21c3f103"
+}

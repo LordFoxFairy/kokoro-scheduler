@@ -1,97 +1,48 @@
-# kokoro-scheduler Contract
+# kokoro-scheduler contract
 
-Canonical machine source: [`openapi/v1/openapi.yaml`](./openapi/v1/openapi.yaml). Human-readable runtime semantics live in
-[`../docs/API_CONTRACT.md`](../docs/API_CONTRACT.md); they do not form a second wire source.
+Canonical machine source: [`openapi/v1/openapi.yaml`](./openapi/v1/openapi.yaml). The file uses the JSON representation accepted by YAML 1.2 and OpenAPI 3.1, so the repository can parse it with Go's standard JSON decoder without a second generated source. Human-readable policy in [`../docs/API_CONTRACT.md`](../docs/API_CONTRACT.md) is explanatory only.
 
-## Owner
+## Owner and scope
 
-**Owner:** `kokoro-scheduler`.
+- owner: `kokoro-scheduler`
+- inbound visibility: `internal-owner`
+- dispatch visibility: `event-protocol`
+- version: `1.0.0`
+- command prefix: `/internal/scheduler/v1/schedules/`
 
-The contract covers only generic Schedule registration/control, health/readiness, and Scheduler-to-owner dispatch metadata.
-It does not define BFF `ScheduledTask`, target business commands, tenant authorization, business receipt, or another repository's
-DTO/Schema.
+The contract covers the implemented health/readiness probes and tenant-scoped Schedule create/replace/delete/pause/resume commands. `components.schemas.Occurrence` records the owner-controlled occurrence lifecycle vocabulary. `webhooks.scheduleOccurrenceDispatch` defines the Scheduler-to-target POST/PUT body, stable occurrence identity headers, and retry classification. Occurrence and outbox persistence do not currently have query endpoints; the contract does not invent one.
 
-## Visibility
+It does not own BFF `ScheduledTask`, target-specific business commands, IAM authorization, or another repository's DTO/schema.
 
-**Visibility:** `internal-owner`.
+## Lint and runtime parity
 
-The listener is for trusted service/deployment traffic. It is not a public Product API, browser API, OAuth resource, AG-UI stream,
-or Developer API portal source. `/healthz` and `/readyz` are unauthenticated operational probes but remain part of this internal
-service contract.
+Run the blocking contract gate:
 
-## Version
+```bash
+./scripts/contract-check
+```
 
-**Version:** `1.0.0`, with versioned command paths under `/internal/scheduler/v1/`.
+The gate parses the canonical artifact, resolves every local `$ref`, verifies all operation governance extensions, checks Schedule/Occurrence/dispatch fields, exercises every declared control route against the Go handler, and compares dispatch headers with the concrete HTTP adapter. Empty documents and human-only descriptions do not pass.
 
-The OpenAPI `info.version` is authoritative for the document version. Probe paths are intentionally unversioned operational
-endpoints; command resources carry the explicit `v1` path segment.
+## Breaking policy
 
-## Generation
-
-**Generation:** the OpenAPI YAML is owner-authored and code-reviewed in this repository; it is not generated from Go structs.
-The current repository has no generated client/server tree. Runtime transport tests validate the implemented boundary, and the
-architecture test checks that the canonical document contains every HTTP route.
-
-If generated clients are introduced, they must be derived from this exact versioned source, written only to an explicit generated
-directory, carry source version/commit/digest metadata, and never become Domain models or an editable contract copy.
-
-## Breaking changes
-
-**Breaking policy:** v1 changes must remain backward compatible. Removing/renaming a path, method, header, request/response field,
-status/error code, tightening an accepted constraint, changing authentication/idempotency semantics, or changing an extension's
-meaning requires a new major contract path/version and coordinated consumer migration. Optional additive fields or responses still
-require owner review, tests, docs, and an `info.version` update appropriate to semantic impact.
+[`openapi/v1/breaking-policy.json`](./openapi/v1/breaking-policy.json) is the v1 compatibility signature. The gate fails when a protected path, method, Schedule input field, Occurrence field, dispatch header, or retryable status is removed. Tightening constraints or changing semantics still requires owner review; an incompatible change must use a new major contract and coordinated consumer update rather than a runtime compatibility route.
 
 Change order:
 
-1. update this owner source;
-2. run OpenAPI governance and transport contract checks;
-3. update implementation/tests and human docs in the same commit;
-4. publish/pin the contract artifact by immutable Git revision and digest;
-5. update consumers from that pinned provenance;
-6. run integration/smoke before rollout.
-
-There is currently no standalone historical OpenAPI breaking-diff tool in this Go repository. Breaking safety therefore depends on
-review plus version discipline until such a gate is added; a governance-key check is not a substitute for compatibility analysis.
+1. edit the canonical OpenAPI and implementation together;
+2. update the compatibility signature only for an intentional reviewed contract decision;
+3. recompute `contract/manifest.json`'s `source_sha256`;
+4. run `./scripts/contract-check`, integration, and smoke gates;
+5. publish consumers against an immutable commit and digest.
 
 ## Provenance
 
-**Provenance:** `https://github.com/LordFoxFairy/kokoro-scheduler`, path
-`contract/openapi/v1/openapi.yaml`. The content digest for this revision is:
-
-```text
-sha256:7806249ddfcb42bbb805ab7c9c5479c277164651da69644c841eca3210261526
-```
-
-Consumers must record `{repository, git tag-or-commit, path, info.version, sha256}`. Recompute and verify with:
+[`manifest.json`](./manifest.json) records owner, visibility, artifact path, semantic version, source mode, breaking-policy path, and SHA-256 digests for both the canonical artifact and compatibility signature. `TestContractProvenanceDigestMatchesCanonicalArtifact` blocks stale provenance. Recompute the digest with:
 
 ```bash
 shasum -a 256 contract/openapi/v1/openapi.yaml
-git rev-parse HEAD
+shasum -a 256 contract/openapi/v1/breaking-policy.json
 ```
 
-A mutable branch name or copied YAML without its commit and digest is not valid provenance.
-
-## Operation governance extensions
-
-Every operation carries all five fields:
-
-| Extension | v1 values | Meaning |
-|---|---|---|
-| `x-kokoro-owner` | `kokoro-scheduler` | This repository owns the operation |
-| `x-kokoro-visibility` | `internal-owner` | Trusted internal service surface only |
-| `x-kokoro-stability` | `stable` | v1 compatibility policy applies |
-| `x-kokoro-idempotency` | `inherent` / `required` | GET probes are inherent; every mutation requires `Idempotency-Key` |
-| `x-kokoro-permission` | `none` / `service-token` | probes are open; commands require the configured shared Bearer token |
-
-`service-token` describes current enforcement and does not assert an IAM fine-grained permission that the runtime does not check.
-
-## Checks
-
-```bash
-go test ./internal/architecture ./internal/transport/http
-```
-
-The Kokoro Root workspace also provides the targeted governance invocation documented in
-[`../docs/ACCEPTANCE.md`](../docs/ACCEPTANCE.md), which checks route versioning, snake_case wire properties, all five operation
-extensions, and the required README governance fields.
+A consumer provenance record is `{repository, commit, artifact, contract_version, source_sha256}`; a mutable branch or copied file alone is insufficient.

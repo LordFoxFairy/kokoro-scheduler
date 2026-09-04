@@ -1,409 +1,1068 @@
-openapi: 3.1.0
-info:
-  title: Kokoro Scheduler Internal API
-  version: 1.0.0
-servers:
-  - url: /
-paths:
-  /healthz:
-    get:
-      operationId: health
-      x-kokoro-owner: kokoro-scheduler
-      x-kokoro-visibility: internal-owner
-      x-kokoro-stability: stable
-      x-kokoro-idempotency: inherent
-      x-kokoro-permission: none
-      responses:
-        "200":
-          description: Process is alive.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ProbeResponse"
-  /readyz:
-    get:
-      operationId: readiness
-      x-kokoro-owner: kokoro-scheduler
-      x-kokoro-visibility: internal-owner
-      x-kokoro-stability: stable
-      x-kokoro-idempotency: inherent
-      x-kokoro-permission: none
-      responses:
-        "200":
-          description: Scheduler and configured coordination dependency are ready.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ProbeResponse"
-        "503":
-          $ref: "#/components/responses/Error"
-  /internal/scheduler/v1/jobs/{name}:
-    parameters:
-      - $ref: "#/components/parameters/JobName"
-      - $ref: "#/components/parameters/RequestId"
-      - $ref: "#/components/parameters/IdempotencyKey"
-    post:
-      operationId: registerJob
-      x-kokoro-owner: kokoro-scheduler
-      x-kokoro-visibility: internal-owner
-      x-kokoro-stability: stable
-      x-kokoro-idempotency: required
-      x-kokoro-permission: service-token
-      security:
-        - serviceBearer: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/JobInput"
-      responses:
-        "200":
-          $ref: "#/components/responses/JobMutation"
-        "400":
-          $ref: "#/components/responses/Error"
-        "401":
-          $ref: "#/components/responses/Error"
-        "409":
-          $ref: "#/components/responses/Error"
-    put:
-      operationId: updateJob
-      x-kokoro-owner: kokoro-scheduler
-      x-kokoro-visibility: internal-owner
-      x-kokoro-stability: stable
-      x-kokoro-idempotency: required
-      x-kokoro-permission: service-token
-      security:
-        - serviceBearer: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/JobInput"
-      responses:
-        "200":
-          $ref: "#/components/responses/JobMutation"
-        "400":
-          $ref: "#/components/responses/Error"
-        "401":
-          $ref: "#/components/responses/Error"
-        "404":
-          $ref: "#/components/responses/Error"
-        "409":
-          $ref: "#/components/responses/Error"
-    delete:
-      operationId: deleteJob
-      x-kokoro-owner: kokoro-scheduler
-      x-kokoro-visibility: internal-owner
-      x-kokoro-stability: stable
-      x-kokoro-idempotency: required
-      x-kokoro-permission: service-token
-      security:
-        - serviceBearer: []
-      responses:
-        "200":
-          description: Job was deleted.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/StatusResponse"
-        "400":
-          $ref: "#/components/responses/Error"
-        "401":
-          $ref: "#/components/responses/Error"
-        "404":
-          $ref: "#/components/responses/Error"
-  /internal/scheduler/v1/jobs/{name}/pause:
-    post:
-      operationId: pauseJob
-      x-kokoro-owner: kokoro-scheduler
-      x-kokoro-visibility: internal-owner
-      x-kokoro-stability: stable
-      x-kokoro-idempotency: required
-      x-kokoro-permission: service-token
-      security:
-        - serviceBearer: []
-      parameters:
-        - $ref: "#/components/parameters/JobName"
-        - $ref: "#/components/parameters/RequestId"
-        - $ref: "#/components/parameters/IdempotencyKey"
-      responses:
-        "200":
-          $ref: "#/components/responses/PauseMutation"
-        "400":
-          $ref: "#/components/responses/Error"
-        "401":
-          $ref: "#/components/responses/Error"
-        "404":
-          $ref: "#/components/responses/Error"
-  /internal/scheduler/v1/jobs/{name}/resume:
-    post:
-      operationId: resumeJob
-      x-kokoro-owner: kokoro-scheduler
-      x-kokoro-visibility: internal-owner
-      x-kokoro-stability: stable
-      x-kokoro-idempotency: required
-      x-kokoro-permission: service-token
-      security:
-        - serviceBearer: []
-      parameters:
-        - $ref: "#/components/parameters/JobName"
-        - $ref: "#/components/parameters/RequestId"
-        - $ref: "#/components/parameters/IdempotencyKey"
-      responses:
-        "200":
-          $ref: "#/components/responses/PauseMutation"
-        "400":
-          $ref: "#/components/responses/Error"
-        "401":
-          $ref: "#/components/responses/Error"
-        "404":
-          $ref: "#/components/responses/Error"
-components:
-  securitySchemes:
-    serviceBearer:
-      type: http
-      scheme: bearer
-  parameters:
-    JobName:
-      name: name
-      in: path
-      required: true
-      schema:
-        type: string
-        pattern: "^[a-z0-9][a-z0-9._-]{0,63}$"
-    RequestId:
-      name: X-Request-Id
-      in: header
-      required: true
-      schema:
-        type: string
-        minLength: 1
-        maxLength: 128
-    IdempotencyKey:
-      name: Idempotency-Key
-      in: header
-      required: true
-      schema:
-        type: string
-        minLength: 1
-        maxLength: 256
-  responses:
-    Error:
-      description: Stable error envelope.
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-    JobMutation:
-      description: Job mutation completed.
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/JobMutationResponse"
-    PauseMutation:
-      description: Pause state changed.
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/PauseResponse"
-  schemas:
-    Meta:
-      type: object
-      additionalProperties: false
-      required:
-        - request_id
-      properties:
-        request_id:
-          type: string
-    RetryPolicy:
-      type: object
-      additionalProperties: false
-      properties:
-        max_attempts:
-          type: integer
-          minimum: 1
-          maximum: 10
-          default: 1
-        backoff_seconds:
-          type: integer
-          minimum: 1
-          maximum: 3600
-          default: 1
-        max_backoff_seconds:
-          type: integer
-          minimum: 1
-          maximum: 3600
-          default: 3600
-        max_retry_window_seconds:
-          type: integer
-          minimum: 1
-          maximum: 86400
-          default: 3600
-    JobInput:
-      type: object
-      additionalProperties: false
-      required:
-        - schedule
-        - url
-      properties:
-        name:
-          type: string
-        schedule:
-          type: string
-        url:
-          type: string
-          format: uri
-          description: >-
-            Absolute http or https target URL. Credentials and fragments are
-            rejected; ports must be in the range 1-65535. Literal and resolved
-            addresses must not be localhost, loopback, unspecified, private,
-            link-local, multicast, or special-use/reserved ranges.
-        method:
-          type: string
-          enum:
-            - POST
-            - PUT
-          default: POST
-        body:
-          type: object
-          default: {}
-        retry:
-          $ref: "#/components/schemas/RetryPolicy"
-        misfire_policy:
-          type: string
-          enum:
-            - skip
-            - fire_once
-          default: skip
-        paused:
-          type: boolean
-          default: false
-    Job:
-      allOf:
-        - $ref: "#/components/schemas/JobInput"
-        - type: object
-          required:
-            - name
-            - method
-            - body
-            - retry
-            - misfire_policy
-            - paused
-    ProbeData:
-      type: object
-      additionalProperties: false
-      required:
-        - service
-        - status
-      properties:
-        service:
-          type: string
-          const: kokoro-scheduler
-        status:
-          type: string
-          const: ok
-    ProbeResponse:
-      type: object
-      additionalProperties: false
-      required:
-        - data
-        - meta
-      properties:
-        data:
-          $ref: "#/components/schemas/ProbeData"
-        meta:
-          $ref: "#/components/schemas/Meta"
-    JobMutationData:
-      type: object
-      additionalProperties: false
-      required:
-        - job
-        - status
-      properties:
-        job:
-          $ref: "#/components/schemas/Job"
-        status:
-          type: string
-          enum:
-            - registered
-            - updated
-    JobMutationResponse:
-      type: object
-      additionalProperties: false
-      required:
-        - data
-        - meta
-      properties:
-        data:
-          $ref: "#/components/schemas/JobMutationData"
-        meta:
-          $ref: "#/components/schemas/Meta"
-    StatusData:
-      type: object
-      additionalProperties: false
-      required:
-        - name
-        - status
-      properties:
-        name:
-          type: string
-        status:
-          type: string
-          const: deleted
-    StatusResponse:
-      type: object
-      additionalProperties: false
-      required:
-        - data
-        - meta
-      properties:
-        data:
-          $ref: "#/components/schemas/StatusData"
-        meta:
-          $ref: "#/components/schemas/Meta"
-    PauseData:
-      type: object
-      additionalProperties: false
-      required:
-        - name
-        - paused
-      properties:
-        name:
-          type: string
-        paused:
-          type: boolean
-    PauseResponse:
-      type: object
-      additionalProperties: false
-      required:
-        - data
-        - meta
-      properties:
-        data:
-          $ref: "#/components/schemas/PauseData"
-        meta:
-          $ref: "#/components/schemas/Meta"
-    ErrorData:
-      type: object
-      additionalProperties: false
-      required:
-        - code
-        - message
-      properties:
-        code:
-          type: string
-        message:
-          type: string
-    ErrorResponse:
-      type: object
-      additionalProperties: false
-      required:
-        - error
-        - meta
-      properties:
-        error:
-          $ref: "#/components/schemas/ErrorData"
-        meta:
-          $ref: "#/components/schemas/Meta"
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Kokoro Scheduler Internal API",
+    "version": "1.0.0",
+    "description": "Tenant-scoped durable schedule commands. PostgreSQL command receipts provide exact idempotent replay."
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ],
+  "paths": {
+    "/healthz": {
+      "get": {
+        "operationId": "health",
+        "x-kokoro-owner": "kokoro-scheduler",
+        "x-kokoro-visibility": "internal-owner",
+        "x-kokoro-stability": "stable",
+        "x-kokoro-idempotency": "inherent",
+        "x-kokoro-permission": "none",
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Probe"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "operationId": "readiness",
+        "x-kokoro-owner": "kokoro-scheduler",
+        "x-kokoro-visibility": "internal-owner",
+        "x-kokoro-stability": "stable",
+        "x-kokoro-idempotency": "inherent",
+        "x-kokoro-permission": "none",
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Probe"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/internal/scheduler/v1/schedules/{name}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ScheduleName"
+        },
+        {
+          "$ref": "#/components/parameters/TenantId"
+        },
+        {
+          "$ref": "#/components/parameters/RequestId"
+        },
+        {
+          "$ref": "#/components/parameters/IdempotencyKey"
+        }
+      ],
+      "post": {
+        "operationId": "createSchedule",
+        "x-kokoro-owner": "kokoro-scheduler",
+        "x-kokoro-visibility": "internal-owner",
+        "x-kokoro-stability": "stable",
+        "x-kokoro-idempotency": "required-durable-receipt",
+        "x-kokoro-permission": "service-token",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScheduleInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/ScheduleCommand"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "put": {
+        "operationId": "replaceSchedule",
+        "x-kokoro-owner": "kokoro-scheduler",
+        "x-kokoro-visibility": "internal-owner",
+        "x-kokoro-stability": "stable",
+        "x-kokoro-idempotency": "required-durable-receipt",
+        "x-kokoro-permission": "service-token",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScheduleInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/ScheduleCommand"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteSchedule",
+        "x-kokoro-owner": "kokoro-scheduler",
+        "x-kokoro-visibility": "internal-owner",
+        "x-kokoro-stability": "stable",
+        "x-kokoro-idempotency": "required-durable-receipt",
+        "x-kokoro-permission": "service-token",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/ScheduleCommand"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmptyCommand"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/internal/scheduler/v1/schedules/{name}/pause": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ScheduleName"
+        },
+        {
+          "$ref": "#/components/parameters/TenantId"
+        },
+        {
+          "$ref": "#/components/parameters/RequestId"
+        },
+        {
+          "$ref": "#/components/parameters/IdempotencyKey"
+        }
+      ],
+      "post": {
+        "operationId": "pauseSchedule",
+        "x-kokoro-owner": "kokoro-scheduler",
+        "x-kokoro-visibility": "internal-owner",
+        "x-kokoro-stability": "stable",
+        "x-kokoro-idempotency": "required-durable-receipt",
+        "x-kokoro-permission": "service-token",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmptyCommand"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/ScheduleCommand"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/internal/scheduler/v1/schedules/{name}/resume": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ScheduleName"
+        },
+        {
+          "$ref": "#/components/parameters/TenantId"
+        },
+        {
+          "$ref": "#/components/parameters/RequestId"
+        },
+        {
+          "$ref": "#/components/parameters/IdempotencyKey"
+        }
+      ],
+      "post": {
+        "operationId": "resumeSchedule",
+        "x-kokoro-owner": "kokoro-scheduler",
+        "x-kokoro-visibility": "internal-owner",
+        "x-kokoro-stability": "stable",
+        "x-kokoro-idempotency": "required-durable-receipt",
+        "x-kokoro-permission": "service-token",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmptyCommand"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/ScheduleCommand"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "serviceBearer": {
+        "type": "http",
+        "scheme": "bearer"
+      },
+      "targetBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Optional independent Scheduler-to-target service credential."
+      }
+    },
+    "parameters": {
+      "ScheduleName": {
+        "name": "name",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+        }
+      },
+      "TenantId": {
+        "name": "X-Kokoro-Tenant-Id",
+        "in": "header",
+        "required": true,
+        "description": "Trusted tenant context supplied by the authenticated service caller.",
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "RequestId": {
+        "name": "X-Request-Id",
+        "in": "header",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "IdempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      },
+      "DispatchSchedule": {
+        "name": "X-Kokoro-Scheduler-Schedule",
+        "in": "header",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+        }
+      },
+      "DispatchOccurrence": {
+        "name": "X-Kokoro-Scheduler-Occurrence",
+        "in": "header",
+        "required": true,
+        "description": "The concrete occurrence UTC instant.",
+        "schema": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "Z$"
+        }
+      },
+      "Traceparent": {
+        "name": "traceparent",
+        "in": "header",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^00-[0-9a-f]{32}-[0-9a-f]{16}-01$"
+        }
+      }
+    },
+    "responses": {
+      "Probe": {
+        "description": "Process or readiness probe response.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProbeResponse"
+            }
+          }
+        }
+      },
+      "ScheduleCommand": {
+        "description": "Durably recorded schedule command result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ScheduleCommandResponse"
+            }
+          }
+        }
+      },
+      "Error": {
+        "description": "Stable error envelope.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "RetryPolicy": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "max_attempts": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10,
+            "default": 1
+          },
+          "backoff_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3600,
+            "default": 1
+          },
+          "max_backoff_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3600,
+            "default": 3600
+          },
+          "max_retry_window_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 86400,
+            "default": 3600
+          }
+        }
+      },
+      "ScheduleInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schedule",
+          "url"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Optional duplicate of the path name; when present it must match.",
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+            "maxLength": 64
+          },
+          "schedule": {
+            "type": "string",
+            "maxLength": 256,
+            "description": "Five-field minute/hour/day-of-month/month/day-of-week cron, a supported descriptor, or @every duration. DOM and DOW use standard cron OR semantics when both are restricted.",
+            "minLength": 1
+          },
+          "timezone": {
+            "type": "string",
+            "default": "UTC",
+            "description": "UTC or an IANA area/location name.",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^(UTC|[^/]+/.+)$"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Absolute HTTP(S) target URL; runtime egress policy also validates the resolved address."
+          },
+          "method": {
+            "type": "string",
+            "enum": [
+              "POST",
+              "PUT"
+            ],
+            "default": "POST"
+          },
+          "body": {
+            "type": "object",
+            "default": {}
+          },
+          "retry": {
+            "$ref": "#/components/schemas/RetryPolicy"
+          },
+          "misfire_policy": {
+            "type": "string",
+            "enum": [
+              "skip",
+              "fire_once",
+              "catch_up_bounded"
+            ],
+            "default": "fire_once"
+          },
+          "catch_up_limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 1,
+            "description": "Must equal 1 unless misfire_policy is catch_up_bounded."
+          },
+          "overlap_policy": {
+            "type": "string",
+            "enum": [
+              "allow",
+              "forbid"
+            ],
+            "default": "forbid"
+          },
+          "paused": {
+            "type": "boolean",
+            "default": false
+          }
+        }
+      },
+      "Schedule": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "name",
+          "schedule",
+          "timezone",
+          "url",
+          "method",
+          "body",
+          "retry",
+          "misfire_policy",
+          "catch_up_limit",
+          "overlap_policy",
+          "paused",
+          "next_due_at",
+          "version"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+            "maxLength": 64
+          },
+          "schedule": {
+            "type": "string",
+            "maxLength": 256,
+            "description": "Five-field minute/hour/day-of-month/month/day-of-week cron, a supported descriptor, or @every duration. DOM and DOW use standard cron OR semantics when both are restricted.",
+            "minLength": 1
+          },
+          "timezone": {
+            "type": "string",
+            "default": "UTC",
+            "description": "UTC or an IANA area/location name.",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^(UTC|[^/]+/.+)$"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Absolute HTTP(S) target URL; runtime egress policy also validates the resolved address."
+          },
+          "method": {
+            "type": "string",
+            "enum": [
+              "POST",
+              "PUT"
+            ],
+            "default": "POST"
+          },
+          "body": {
+            "type": "object",
+            "default": {}
+          },
+          "retry": {
+            "$ref": "#/components/schemas/ResolvedRetryPolicy"
+          },
+          "misfire_policy": {
+            "type": "string",
+            "enum": [
+              "skip",
+              "fire_once",
+              "catch_up_bounded"
+            ],
+            "default": "fire_once"
+          },
+          "catch_up_limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 1,
+            "description": "Must equal 1 unless misfire_policy is catch_up_bounded."
+          },
+          "overlap_policy": {
+            "type": "string",
+            "enum": [
+              "allow",
+              "forbid"
+            ],
+            "default": "forbid"
+          },
+          "paused": {
+            "type": "boolean",
+            "default": false
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "next_due_at": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "Z$",
+            "description": "RFC 3339 UTC instant."
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
+      "ScheduleCommandResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "data",
+          "meta"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "status"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "registered",
+                  "updated",
+                  "deleted",
+                  "paused",
+                  "resumed"
+                ]
+              },
+              "schedule": {
+                "$ref": "#/components/schemas/Schedule"
+              }
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        }
+      },
+      "ProbeResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "data",
+          "meta"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "status",
+              "service"
+            ],
+            "properties": {
+              "status": {
+                "const": "ok"
+              },
+              "service": {
+                "const": "kokoro-scheduler"
+              }
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        }
+      },
+      "EmptyCommand": {
+        "type": "object",
+        "additionalProperties": false,
+        "maxProperties": 0
+      },
+      "Meta": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "request_id"
+        ],
+        "properties": {
+          "request_id": {
+            "type": "string"
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "error",
+          "meta"
+        ],
+        "properties": {
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "code",
+              "message"
+            ],
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        }
+      },
+      "Occurrence": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "tenant_id",
+          "schedule_id",
+          "schedule_name",
+          "scheduled_at",
+          "observed_at",
+          "status",
+          "missed_count",
+          "attempt_count",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "schedule_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "schedule_name": {
+            "type": "string"
+          },
+          "scheduled_at": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "Z$"
+          },
+          "observed_at": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "Z$"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "dispatching",
+              "retrying",
+              "succeeded",
+              "failed",
+              "skipped"
+            ]
+          },
+          "outcome_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "missed_count": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "attempt_count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10
+          },
+          "last_http_status": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 100,
+            "maximum": 599
+          },
+          "last_error_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error_message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 1024
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "Z$"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "Z$"
+          },
+          "completed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "pattern": "Z$"
+          }
+        },
+        "description": "Machine-readable lifecycle projection for a concrete UTC occurrence; it is currently an owner-internal durable fact, not a query route."
+      },
+      "ResolvedRetryPolicy": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "max_attempts": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10,
+            "default": 1
+          },
+          "backoff_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3600,
+            "default": 1
+          },
+          "max_backoff_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3600,
+            "default": 3600
+          },
+          "max_retry_window_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 86400,
+            "default": 3600
+          }
+        },
+        "required": [
+          "max_attempts",
+          "backoff_seconds",
+          "max_backoff_seconds",
+          "max_retry_window_seconds"
+        ]
+      }
+    }
+  },
+  "webhooks": {
+    "scheduleOccurrenceDispatch": {
+      "post": {
+        "operationId": "dispatchScheduleOccurrencePost",
+        "summary": "Deliver one durable schedule occurrence to its configured target.",
+        "x-kokoro-owner": "kokoro-scheduler",
+        "x-kokoro-visibility": "event-protocol",
+        "x-kokoro-stability": "stable",
+        "x-kokoro-idempotency": "stable-occurrence-key",
+        "x-kokoro-permission": "target-service-token",
+        "x-kokoro-retryable-statuses": [
+          408,
+          425,
+          429,
+          "5xx"
+        ],
+        "x-kokoro-permanent-statuses": [
+          "other-non-2xx"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TenantId"
+          },
+          {
+            "$ref": "#/components/parameters/DispatchSchedule"
+          },
+          {
+            "$ref": "#/components/parameters/DispatchOccurrence"
+          },
+          {
+            "$ref": "#/components/parameters/RequestId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Traceparent"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "Opaque JSON object captured with the Schedule and persisted in the dispatch outbox.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Occurrence accepted or completed."
+          },
+          "201": {
+            "description": "Occurrence accepted and a target resource was created."
+          },
+          "202": {
+            "description": "Occurrence accepted asynchronously."
+          },
+          "204": {
+            "description": "Occurrence accepted without a response body."
+          },
+          "default": {
+            "description": "408, 425, 429, and 5xx are retryable; every other non-2xx response is permanent."
+          }
+        },
+        "security": [
+          {
+            "targetBearer": []
+          },
+          {}
+        ]
+      },
+      "put": {
+        "operationId": "dispatchScheduleOccurrencePut",
+        "summary": "Deliver one durable schedule occurrence to its configured target.",
+        "x-kokoro-owner": "kokoro-scheduler",
+        "x-kokoro-visibility": "event-protocol",
+        "x-kokoro-stability": "stable",
+        "x-kokoro-idempotency": "stable-occurrence-key",
+        "x-kokoro-permission": "target-service-token",
+        "x-kokoro-retryable-statuses": [
+          408,
+          425,
+          429,
+          "5xx"
+        ],
+        "x-kokoro-permanent-statuses": [
+          "other-non-2xx"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TenantId"
+          },
+          {
+            "$ref": "#/components/parameters/DispatchSchedule"
+          },
+          {
+            "$ref": "#/components/parameters/DispatchOccurrence"
+          },
+          {
+            "$ref": "#/components/parameters/RequestId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Traceparent"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "Opaque JSON object captured with the Schedule and persisted in the dispatch outbox.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Occurrence accepted or completed."
+          },
+          "201": {
+            "description": "Occurrence accepted and a target resource was created."
+          },
+          "202": {
+            "description": "Occurrence accepted asynchronously."
+          },
+          "204": {
+            "description": "Occurrence accepted without a response body."
+          },
+          "default": {
+            "description": "408, 425, 429, and 5xx are retryable; every other non-2xx response is permanent."
+          }
+        },
+        "security": [
+          {
+            "targetBearer": []
+          },
+          {}
+        ]
+      }
+    }
+  }
+}

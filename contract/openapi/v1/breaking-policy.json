@@ -1,0 +1,88 @@
+{
+  "contract_major": 1,
+  "required_paths": {
+    "/healthz": [
+      "get"
+    ],
+    "/readyz": [
+      "get"
+    ],
+    "/internal/scheduler/v1/schedules/{name}": [
+      "post",
+      "put",
+      "delete"
+    ],
+    "/internal/scheduler/v1/schedules/{name}/pause": [
+      "post"
+    ],
+    "/internal/scheduler/v1/schedules/{name}/resume": [
+      "post"
+    ]
+  },
+  "required_schedule_input_fields": [
+    "schedule",
+    "timezone",
+    "url",
+    "method",
+    "body",
+    "retry",
+    "misfire_policy",
+    "catch_up_limit",
+    "overlap_policy",
+    "paused"
+  ],
+  "required_occurrence_fields": [
+    "id",
+    "tenant_id",
+    "schedule_id",
+    "schedule_name",
+    "scheduled_at",
+    "observed_at",
+    "status",
+    "outcome_code",
+    "missed_count",
+    "attempt_count",
+    "last_http_status",
+    "last_error_code",
+    "last_error_message",
+    "created_at",
+    "updated_at",
+    "completed_at"
+  ],
+  "required_dispatch_headers": [
+    "X-Kokoro-Tenant-Id",
+    "X-Kokoro-Scheduler-Schedule",
+    "X-Kokoro-Scheduler-Occurrence",
+    "X-Request-Id",
+    "Idempotency-Key",
+    "traceparent"
+  ],
+  "required_retryable_statuses": [
+    "408",
+    "425",
+    "429",
+    "5xx"
+  ],
+  "required_schedule_response_fields": [
+    "id",
+    "name",
+    "schedule",
+    "timezone",
+    "url",
+    "method",
+    "body",
+    "retry",
+    "misfire_policy",
+    "catch_up_limit",
+    "overlap_policy",
+    "paused",
+    "next_due_at",
+    "version"
+  ],
+  "required_resolved_retry_fields": [
+    "max_attempts",
+    "backoff_seconds",
+    "max_backoff_seconds",
+    "max_retry_window_seconds"
+  ]
+}
