@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -35,7 +36,21 @@ func NewClient(httpClient *http.Client, targetServiceToken string) *Client {
 }
 
 func NewDefaultClient(timeout time.Duration, targetServiceToken string) *Client {
-	return NewClient(&http.Client{Timeout: timeout}, targetServiceToken)
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   timeout,
+		ResponseHeaderTimeout: timeout,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	return NewClient(&http.Client{Transport: transport, Timeout: timeout}, targetServiceToken)
 }
 
 func (c *Client) Dispatch(ctx context.Context, job domain.Job, occurrence domain.Occurrence) domain.RunResult {

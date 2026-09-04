@@ -51,3 +51,23 @@ func TestClientClassifiesTimeout(t *testing.T) {
 		t.Fatalf("code = %q, result = %#v", result.Code, result)
 	}
 }
+
+func TestNewDefaultClientConfiguresPhaseTimeouts(t *testing.T) {
+	client := NewDefaultClient(3*time.Second, "")
+	transport, ok := client.httpClient.Transport.(*http.Transport)
+	if !ok || transport == nil {
+		t.Fatalf("default transport = %#v, want *http.Transport", client.httpClient.Transport)
+	}
+	if transport.DialContext == nil {
+		t.Fatal("default transport must configure a bounded dialer")
+	}
+	if transport.TLSHandshakeTimeout != 3*time.Second {
+		t.Fatalf("TLSHandshakeTimeout = %s, want 3s", transport.TLSHandshakeTimeout)
+	}
+	if transport.ResponseHeaderTimeout != 3*time.Second {
+		t.Fatalf("ResponseHeaderTimeout = %s, want 3s", transport.ResponseHeaderTimeout)
+	}
+	if transport.IdleConnTimeout <= 0 {
+		t.Fatalf("IdleConnTimeout = %s, want a positive connection lifetime", transport.IdleConnTimeout)
+	}
+}
