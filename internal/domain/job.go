@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/robfig/cron/v3"
@@ -111,12 +113,8 @@ func (j Job) Validate() error {
 	if _, err := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor).Parse(j.Schedule); err != nil {
 		return fmt.Errorf("%q has invalid schedule: %w", j.Name, err)
 	}
-	parsedURL, err := url.Parse(j.URL)
-	if err != nil || parsedURL.Host == "" || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
-		return fmt.Errorf("%q has invalid url", j.Name)
-	}
-	if parsedURL.User != nil || parsedURL.Fragment != "" {
-		return fmt.Errorf("%q has invalid url credentials or fragment", j.Name)
+	if err := ValidateTargetURL(j.URL); err != nil {
+		return fmt.Errorf("%q has invalid url: %w", j.Name, err)
 	}
 	if j.Method != MethodPost && j.Method != MethodPut {
 		return fmt.Errorf("%q has unsupported method %q", j.Name, j.Method)
@@ -135,6 +133,115 @@ func (j Job) Validate() error {
 		return fmt.Errorf("%q has invalid misfire_policy %q", j.Name, j.MisfirePolicy)
 	}
 	return nil
+}
+
+// ValidateTargetURL validates the URL syntax that is safe to retain in a Job.
+// DNS answers are checked separately by the outbound adapter immediately before
+// dialing, where the selected address is also pinned into the request URL.
+func ValidateTargetURL(rawURL string) error {
+	return validateTargetURL(rawURL, true)
+}
+
+// ValidateTargetURLSyntax validates URL syntax without evaluating a literal
+// address. The outbound adapter uses this before applying its resolver and
+// address policy; Job validation uses ValidateTargetURL to reject unsafe
+// literals before they enter the registry.
+func ValidateTargetURLSyntax(rawURL string) error {
+	return validateTargetURL(rawURL, false)
+}
+
+func validateTargetURL(rawURL string, rejectUnsafeLiteral bool) error {
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil || parsedURL.Host == "" {
+		return errors.New("target must be an absolute HTTP(S) URL with a host")
+	}
+	if !strings.EqualFold(parsedURL.Scheme, "http") && !strings.EqualFold(parsedURL.Scheme, "https") {
+		return errors.New("target scheme must be http or https")
+	}
+	if parsedURL.User != nil || parsedURL.Fragment != "" {
+		return errors.New("target must not contain credentials or a fragment")
+	}
+	if strings.HasSuffix(parsedURL.Host, ":") {
+		return errors.New("target port must be a number between 1 and 65535")
+	}
+	if port := parsedURL.Port(); port != "" {
+		parsedPort, parseErr := strconv.Atoi(port)
+		if parseErr != nil || parsedPort < 1 || parsedPort > 65535 {
+			return errors.New("target port must be a number between 1 and 65535")
+		}
+	}
+	hostname := strings.TrimSuffix(strings.ToLower(parsedURL.Hostname()), ".")
+	if hostname == "" {
+		return errors.New("target host must not be empty")
+	}
+	if hostname == "localhost" || strings.HasSuffix(hostname, ".localhost") {
+		return errors.New("target localhost is not allowed")
+	}
+	if strings.Contains(hostname, "%") {
+		return errors.New("target host is not allowed")
+	}
+	if _, parseErr := netip.ParseAddr(hostname); parseErr != nil && numericHostname(hostname) {
+		return errors.New("target host is not allowed")
+	}
+	if rejectUnsafeLiteral {
+		if address, parseErr := netip.ParseAddr(hostname); parseErr == nil && !IsSafeTargetAddress(address) {
+			return errors.New("target IP address is not allowed")
+		}
+	}
+	return nil
+}
+
+// IsSafeTargetAddress returns whether an IP address is suitable for an
+// outbound dynamic target. It intentionally excludes special-use ranges even
+// when the platform would route them as global unicast.
+func IsSafeTargetAddress(address netip.Addr) bool {
+	if !address.IsValid() {
+		return false
+	}
+	if address.Zone() != "" {
+		return false
+	}
+	address = address.Unmap()
+	if !address.IsGlobalUnicast() || address.IsLoopback() || address.IsPrivate() || address.IsUnspecified() || address.IsLinkLocalUnicast() || address.IsMulticast() {
+		return false
+	}
+	for _, prefix := range reservedTargetPrefixes {
+		if prefix.Contains(address) {
+			return false
+		}
+	}
+	return true
+}
+
+var reservedTargetPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.31.196.0/24"),
+	netip.MustParsePrefix("192.52.193.0/24"),
+	netip.MustParsePrefix("192.88.99.0/24"),
+	netip.MustParsePrefix("192.175.48.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("2001:2::/48"),
+	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("2001:10::/28"),
+	netip.MustParsePrefix("3fff::/20"),
+}
+
+func numericHostname(hostname string) bool {
+	if hostname == "" {
+		return false
+	}
+	for _, character := range hostname {
+		if (character < '0' || character > '9') && character != '.' {
+			return false
+		}
+	}
+	return true
 }
 
 func (j Job) Normalized() (Job, error) {

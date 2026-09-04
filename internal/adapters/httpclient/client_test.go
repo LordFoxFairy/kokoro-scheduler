@@ -2,9 +2,11 @@ package httpclient
 
 import (
 	"context"
+	"io"
 	"net/http"
-	"net/http/httptest"
+	"net/netip"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,14 +15,11 @@ import (
 
 func TestClientDispatchUsesStableUTCIdentityAndTargetAuth(t *testing.T) {
 	var got http.Header
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = r.Header.Clone()
-		w.WriteHeader(http.StatusAccepted)
-	}))
-	defer server.Close()
-
-	client := NewDefaultClient(time.Second, "target-service-token")
-	job := domain.Job{Name: "billing.reconcile", Schedule: "@every 1m", URL: server.URL, Method: "POST", Body: []byte(`{"tenant_id":"TENANT"}`), Retry: domain.RetryPolicy{MaxAttempts: 1}}
+	client := NewClientWithResolver(&http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		got = request.Header.Clone()
+		return &http.Response{StatusCode: http.StatusAccepted, Body: http.NoBody, Header: make(http.Header), Request: request}, nil
+	})}, "target-service-token", &fixedResolver{addresses: []netip.Addr{netip.MustParseAddr("93.184.216.34")}}, nil)
+	job := domain.Job{Name: "billing.reconcile", Schedule: "@every 1m", URL: "http://service.test/command", Method: "POST", Body: []byte(`{"tenant_id":"TENANT"}`), Retry: domain.RetryPolicy{MaxAttempts: 1}}
 	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.FixedZone("fixture", -5*60*60))
 	result := client.Dispatch(context.Background(), job, domain.NewOccurrence(job.Name, at, at))
 	if result.Err != nil || result.Status != http.StatusAccepted {
@@ -38,12 +37,11 @@ func TestClientDispatchUsesStableUTCIdentityAndTargetAuth(t *testing.T) {
 }
 
 func TestClientClassifiesTimeout(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(100 * time.Millisecond)
-	}))
-	defer server.Close()
-	client := NewClient(&http.Client{}, "")
-	job := domain.Job{Name: "slow", Schedule: "@every 1m", URL: server.URL, Method: "POST", Body: []byte(`{}`), Retry: domain.RetryPolicy{MaxAttempts: 1}}
+	client := NewClientWithResolver(&http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		<-request.Context().Done()
+		return nil, request.Context().Err()
+	})}, "", &fixedResolver{addresses: []netip.Addr{netip.MustParseAddr("93.184.216.34")}}, nil)
+	job := domain.Job{Name: "slow", Schedule: "@every 1m", URL: "http://service.test/command", Method: "POST", Body: []byte(`{}`), Retry: domain.RetryPolicy{MaxAttempts: 1}}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 	result := client.Dispatch(ctx, job, domain.NewOccurrence(job.Name, time.Now(), time.Now()))
@@ -69,5 +67,85 @@ func TestNewDefaultClientConfiguresPhaseTimeouts(t *testing.T) {
 	}
 	if transport.IdleConnTimeout <= 0 {
 		t.Fatalf("IdleConnTimeout = %s, want a positive connection lifetime", transport.IdleConnTimeout)
+	}
+}
+
+func TestClientDoesNotFollowRedirects(t *testing.T) {
+	var calls int
+	client := NewClientWithResolver(&http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
+		response := &http.Response{StatusCode: http.StatusFound, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header), Request: request}
+		response.Header.Set("Location", "http://other.test/command")
+		return response, nil
+	})}, "", &fixedResolver{addresses: []netip.Addr{netip.MustParseAddr("93.184.216.34")}}, nil)
+	job := domain.Job{Name: "redirect", Schedule: "@every 1m", URL: "http://service.test/command", Method: "POST", Body: []byte(`{}`), Retry: domain.RetryPolicy{MaxAttempts: 1}}
+	result := client.Dispatch(context.Background(), job, domain.NewOccurrence(job.Name, time.Now(), time.Now()))
+	if result.Status != http.StatusFound || result.Err == nil {
+		t.Fatalf("redirect result = %#v, want rejected 302", result)
+	}
+	if calls != 1 {
+		t.Fatalf("redirect round trips = %d, want one", calls)
+	}
+}
+
+func TestClientRejectsResponseBodyAboveLimit(t *testing.T) {
+	client := NewClientWithResolver(&http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(strings.Repeat("x", 1<<20+1))), Header: make(http.Header), Request: request}, nil
+	})}, "", &fixedResolver{addresses: []netip.Addr{netip.MustParseAddr("93.184.216.34")}}, nil)
+	job := domain.Job{Name: "large-response", Schedule: "@every 1m", URL: "http://service.test/command", Method: "POST", Body: []byte(`{}`), Retry: domain.RetryPolicy{MaxAttempts: 1}}
+	result := client.Dispatch(context.Background(), job, domain.NewOccurrence(job.Name, time.Now(), time.Now()))
+	if result.Err == nil || result.Code != "SCHEDULER_TARGET_REJECTED" {
+		t.Fatalf("large response result = %#v, want rejected body limit", result)
+	}
+}
+
+type fixedResolver struct {
+	addresses []netip.Addr
+	lookups   int
+}
+
+func (r *fixedResolver) LookupNetIP(_ context.Context, _, _ string) ([]netip.Addr, error) {
+	r.lookups++
+	return r.addresses, nil
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+func TestClientRejectsDNSResolvedPrivateTargetBeforeDial(t *testing.T) {
+	resolver := &fixedResolver{addresses: []netip.Addr{netip.MustParseAddr("10.0.0.1")}}
+	var requests int
+	client := NewClientWithResolver(&http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		requests++
+		return nil, nil
+	})}, "", resolver, nil)
+	job := domain.Job{Name: "private-dns", Schedule: "@every 1m", URL: "http://service.test/command", Method: "POST", Body: []byte(`{}`), Retry: domain.RetryPolicy{MaxAttempts: 1}}
+	result := client.Dispatch(context.Background(), job, domain.NewOccurrence(job.Name, time.Now(), time.Now()))
+	if result.Err == nil || result.Code != "SCHEDULER_TARGET_REJECTED" {
+		t.Fatalf("private DNS result = %#v, want rejected", result)
+	}
+	if resolver.lookups != 1 || requests != 0 {
+		t.Fatalf("resolver lookups=%d requests=%d, want one lookup and no request", resolver.lookups, requests)
+	}
+}
+
+func TestClientPinsResolvedAddressWhilePreservingHTTPHost(t *testing.T) {
+	resolver := &fixedResolver{addresses: []netip.Addr{netip.MustParseAddr("93.184.216.34")}}
+	var gotURLHost, gotHost string
+	client := NewClientWithResolver(&http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		gotURLHost = request.URL.Host
+		gotHost = request.Host
+		return &http.Response{StatusCode: http.StatusAccepted, Body: http.NoBody, Header: make(http.Header)}, nil
+	})}, "", resolver, nil)
+	job := domain.Job{Name: "pinned-dns", Schedule: "@every 1m", URL: "http://service.test/command", Method: "POST", Body: []byte(`{}`), Retry: domain.RetryPolicy{MaxAttempts: 1}}
+	result := client.Dispatch(context.Background(), job, domain.NewOccurrence(job.Name, time.Now(), time.Now()))
+	if result.Err != nil || result.Status != http.StatusAccepted {
+		t.Fatalf("pinned DNS result = %#v", result)
+	}
+	if gotURLHost != "93.184.216.34:80" || gotHost != "service.test" {
+		t.Fatalf("request URL host=%q Host=%q, want pinned address and original host", gotURLHost, gotHost)
 	}
 }

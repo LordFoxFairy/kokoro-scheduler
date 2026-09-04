@@ -71,7 +71,7 @@ port 注入，单元测试可确定性验证边界。
 | Redis lease 过期、清空或不可用 | 重复或停止 dispatch | renew、token fencing、fail closed、目标幂等 | 剩余重复风险由目标 owner receipt 收敛 |
 | 目标 command 非幂等 | retry/不确定结果造成重复副作用 | 稳定 `Idempotency-Key` 契约 | 接入阻断项；目标 owner 负责 durable receipt |
 | 多实例同步重试 | 下游流量尖峰 | capped exponential backoff + crypto full jitter | 已控制，仍需下游 capacity/rate limit |
-| 动态 URL 指向非内部地址 | 数据/credential 边界扩大 | scheme/host/userinfo 校验、部署 egress policy | 进程内 allowlist 缺失；部署/security owner |
+| 动态 URL 指向非内部地址 | 数据/credential 边界扩大 | scheme/host/userinfo/port 校验、literal 与单次 DNS 地址策略、部署 egress policy | 进程内策略不替代部署 hostname/CIDR allowlist；部署/security owner |
 | shared token 泄漏 | 未授权 registry 变更或 target 调用 | secret 注入、分离 inbound/outbound token、日志 redaction | 需要轮换与 secret manager；部署 owner |
 | 可观测性未落 metrics exporter | SLO 无法直接计算 | 稳定日志字段与 SLO 指标契约 | 未实现；部署 observability owner |
 

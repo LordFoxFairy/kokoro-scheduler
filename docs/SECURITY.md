@@ -36,7 +36,9 @@ IAM fine-grained permission。探针使用 `x-kokoro-permission: none`。
 
 ## 3. Outbound dispatch controls
 
-- URL validation 只允许有 host 的 `http` / `https`，拒绝 embedded credentials 和 fragment。
+- URL validation 只允许有 host 的 `http` / `https`，拒绝 embedded credentials、fragment、异常端口、localhost、loopback、未指定、私有、链路本地、组播和特殊/保留 IP。
+- hostname target 在每次 dispatch 前只解析一次；所有答案先经过地址策略，随后将选中的地址固定到本次请求 URL，同时保留原 Host/HTTPS server name，避免 validation 与实际连接之间的 DNS TOCTOU。默认不启用 allowlist；注入的 `(host, address)` allowlist 只能进一步收窄已允许的全局地址。
+- HTTP client 禁止自动跟随 redirect；目标 response body 读取上限为 1 MiB。
 - method 只允许 `POST` / `PUT`，body 必须是 JSON object。
 - `SCHEDULER_TARGET_SERVICE_TOKEN` 与 inbound token 分离；非空时只写入 `Authorization` header，不写日志。
 - 每次 dispatch 携带稳定 occurrence idempotency identity、request ID 和 W3C `traceparent`；目标 owner 仍须
@@ -44,7 +46,7 @@ IAM fine-grained permission。探针使用 `x-kokoro-permission: none`。
 - context cancellation 与 30 秒 overall timeout 限制单次请求时长；目标 4xx 不重试，429/5xx/网络错误受
   attempt 与时间窗口双重约束。
 
-当前进程没有目标 hostname/CIDR allowlist，也允许内部明文 HTTP；生产部署必须通过受审配置、DNS/egress
+当前进程不提供可配置的 hostname/CIDR allowlist；默认地址策略拒绝特殊网段，生产部署仍必须通过受审配置、DNS/egress
 network policy 和目标服务认证把 dispatch 限制在内部 endpoint。任何允许修改 ScheduleJob 的 caller 都等价于
 拥有创建出站请求的能力，必须保持在受信服务边界内。
 
@@ -71,9 +73,8 @@ HTTP status/Go error，不读取或记录目标 response body。
 ## 6. 当前风险与后续安全门禁
 
 1. shared bearer token 无 caller-level audit/permission；升级认证机制必须先改 owner contract 和 consumer。
-2. URL allowlist 依赖部署而非进程内强制；暴露 command surface 前必须验证 egress policy。
-3. Go default transport 目前没有分别配置 connect/TLS/response-header timeout；overall timeout 是现有最后边界。
-4. registry/receipt 是内存结构；1 MiB body limit 与 10,000 receipt 上限限制资源占用，但高频可信 caller 仍需
+2. 进程内安全策略不替代部署 egress policy；暴露 command surface 前仍必须验证网络出口和目标服务认证。
+3. registry/receipt 是内存结构；1 MiB request/response body limit 与 10,000 receipt 上限限制资源占用，但高频可信 caller 仍需
    上游 rate limit 和实例资源限制。
-5. 安全变更必须覆盖负向认证、严格 JSON、header 边界、secret redaction 与目标 mock 测试，并同步
+4. 安全变更必须覆盖负向认证、严格 JSON、header 边界、secret redaction 与目标 mock 测试，并同步
    `API_CONTRACT.md` 和 OpenAPI。

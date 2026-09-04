@@ -255,6 +255,11 @@ components:
         url:
           type: string
           format: uri
+          description: >-
+            Absolute http or https target URL. Credentials and fragments are
+            rejected; ports must be in the range 1-65535. Literal and resolved
+            addresses must not be localhost, loopback, unspecified, private,
+            link-local, multicast, or special-use/reserved ranges.
         method:
           type: string
           enum:

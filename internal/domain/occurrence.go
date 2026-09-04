@@ -61,5 +61,8 @@ func (r RunResult) Succeeded() bool {
 }
 
 func Retryable(result RunResult) bool {
+	if result.Code == "SCHEDULER_TARGET_REJECTED" {
+		return false
+	}
 	return result.Status == 0 || result.Status == 429 || result.Status >= 500
 }

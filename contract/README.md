@@ -60,7 +60,7 @@ review plus version discipline until such a gate is added; a governance-key chec
 `contract/openapi/v1/openapi.yaml`. The content digest for this revision is:
 
 ```text
-sha256:480cbc538d6cdb58c36212132b8e012e6d8161969bcfdfe49041ea12ac1eb9c0
+sha256:7806249ddfcb42bbb805ab7c9c5479c277164651da69644c841eca3210261526
 ```
 
 Consumers must record `{repository, git tag-or-commit, path, info.version, sha256}`. Recompute and verify with:

@@ -115,6 +115,21 @@ func TestSchedulerRetriesTransientTargetFailureWithStableIdentity(t *testing.T) 
 	}
 }
 
+func TestSchedulerDoesNotRetryRejectedTargetBoundary(t *testing.T) {
+	target := &doubles.TargetClient{Results: []domain.RunResult{{
+		Code: "SCHEDULER_TARGET_REJECTED",
+		Err:  errors.New("target resolved to a disallowed IP address"),
+	}}}
+	scheduler, _ := newTestScheduler(t, target, nil)
+	job := testJob()
+	job.Retry.MaxAttempts = 2
+
+	result := scheduler.Dispatch(context.Background(), job, time.Unix(100, 0), time.Unix(100, 0))
+	if result.Code != "SCHEDULER_TARGET_REJECTED" || result.Attempts != 1 || target.CallCount() != 1 {
+		t.Fatalf("result=%#v calls=%d, want one non-retried rejected dispatch", result, target.CallCount())
+	}
+}
+
 func TestSchedulerLeasePreventsDuplicateOccurrenceConcurrently(t *testing.T) {
 	target := &doubles.TargetClient{}
 	leaseStore := doubles.NewLeaseStore()

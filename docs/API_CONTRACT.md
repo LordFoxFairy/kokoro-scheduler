@@ -125,7 +125,7 @@ The JSON array contains `ScheduleJob` resources:
 |---|---|---:|---|
 | `name` | string | yes | Stable `[a-z0-9][a-z0-9._-]{0,63}` identifier; unique in one deployment |
 | `schedule` | string | yes | UTC standard cron expression or `@every <duration>` |
-| `url` | string | yes | Internal command endpoint supplied by deployment |
+| `url` | string | yes | Absolute `http`/`https` command endpoint; no credentials or fragment; port must be 1–65535; literal and resolved addresses must not be localhost, loopback, unspecified, private, link-local, multicast, or special-use/reserved ranges |
 | `method` | string | no | `POST` or `PUT`; default `POST` |
 | `body` | object | no | JSON command payload; default `{}` |
 | `retry.max_attempts` | integer | no | 1–10; default `1` |
@@ -194,6 +194,14 @@ targets whose contract does not require service authentication. This outbound
 target credential is separate from `SCHEDULER_INTERNAL_SERVICE_TOKEN`, which authenticates BFF
 requests entering the scheduler command surface. The configured target token
 is reused across retries and is never included in scheduler logs.
+
+Before dispatch, the scheduler resolves a hostname once and pins one permitted
+answer into the request connection while preserving the original HTTP Host
+and HTTPS certificate name. It never follows redirects automatically, and it
+reads at most 1 MiB of target response body. A resolver failure is a transient
+target-unavailable result; an unsafe literal or resolved address is rejected
+without dialing. The optional adapter allowlist can narrow permitted
+`(hostname, resolved address)` pairs and does not permit special-use ranges.
 
 `X-Kokoro-Scheduler-Occurrence` is the stable occurrence identity, formatted
 as the scheduled occurrence timestamp in UTC (`YYYYMMDDTHHMMSSZ`). It is

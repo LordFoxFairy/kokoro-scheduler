@@ -136,12 +136,12 @@ Registry 与 receipt 都只存在当前进程。BFF 拥有业务 `ScheduledTask`
 
 ### Outbound
 
-- URL 必须是有 host、无 userinfo/fragment 的 HTTP(S)；method 只允许 POST/PUT；
+- URL 必须是有 host、无 userinfo/fragment、端口在 1–65535 的 HTTP(S)；literal target 和 dispatch 前单次 DNS 解析结果均拒绝 localhost、loopback、未指定、私有、链路本地、组播及特殊/保留 IP；method 只允许 POST/PUT；
 - `SCHEDULER_TARGET_SERVICE_TOKEN` 非空时发送独立 Bearer；
 - 固定发送 job、occurrence、request、idempotency 和 `traceparent`；
-- current client 使用 30 秒 overall timeout 与 context cancellation。
+- current client 使用 30 秒 overall timeout 与 context cancellation；HTTP client 禁止自动跟随 redirect，响应体最多读取 1 MiB。DNS 结果会被写入本次请求的连接地址，避免校验后再次解析造成 TOCTOU；可注入 resolver 与窄的 `(host, address)` allowlist 仅用于测试或进一步收窄安全地址集合。
 
-目标 allowlist、egress policy、TLS 强制和 secret distribution 由部署边界负责；当前进程没有 host/CIDR allowlist。
+目标 hostname/CIDR allowlist、egress policy、TLS 强制和 secret distribution 仍由部署边界负责；当前进程默认拒绝特殊地址，并支持 adapter 注入更窄的 host/address allowlist。
 完整风险与控制见 [`SECURITY.md`](./SECURITY.md)。
 
 ## 8. 配置 contract
