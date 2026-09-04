@@ -8,6 +8,11 @@ paths:
   /healthz:
     get:
       operationId: health
+      x-kokoro-owner: kokoro-scheduler
+      x-kokoro-visibility: internal-owner
+      x-kokoro-stability: stable
+      x-kokoro-idempotency: inherent
+      x-kokoro-permission: none
       responses:
         "200":
           description: Process is alive.
@@ -18,6 +23,11 @@ paths:
   /readyz:
     get:
       operationId: readiness
+      x-kokoro-owner: kokoro-scheduler
+      x-kokoro-visibility: internal-owner
+      x-kokoro-stability: stable
+      x-kokoro-idempotency: inherent
+      x-kokoro-permission: none
       responses:
         "200":
           description: Scheduler and configured coordination dependency are ready.
@@ -34,6 +44,11 @@ paths:
       - $ref: "#/components/parameters/IdempotencyKey"
     post:
       operationId: registerJob
+      x-kokoro-owner: kokoro-scheduler
+      x-kokoro-visibility: internal-owner
+      x-kokoro-stability: stable
+      x-kokoro-idempotency: required
+      x-kokoro-permission: service-token
       security:
         - serviceBearer: []
       requestBody:
@@ -53,6 +68,11 @@ paths:
           $ref: "#/components/responses/Error"
     put:
       operationId: updateJob
+      x-kokoro-owner: kokoro-scheduler
+      x-kokoro-visibility: internal-owner
+      x-kokoro-stability: stable
+      x-kokoro-idempotency: required
+      x-kokoro-permission: service-token
       security:
         - serviceBearer: []
       requestBody:
@@ -74,6 +94,11 @@ paths:
           $ref: "#/components/responses/Error"
     delete:
       operationId: deleteJob
+      x-kokoro-owner: kokoro-scheduler
+      x-kokoro-visibility: internal-owner
+      x-kokoro-stability: stable
+      x-kokoro-idempotency: required
+      x-kokoro-permission: service-token
       security:
         - serviceBearer: []
       responses:
@@ -92,6 +117,11 @@ paths:
   /internal/scheduler/v1/jobs/{name}/pause:
     post:
       operationId: pauseJob
+      x-kokoro-owner: kokoro-scheduler
+      x-kokoro-visibility: internal-owner
+      x-kokoro-stability: stable
+      x-kokoro-idempotency: required
+      x-kokoro-permission: service-token
       security:
         - serviceBearer: []
       parameters:
@@ -110,6 +140,11 @@ paths:
   /internal/scheduler/v1/jobs/{name}/resume:
     post:
       operationId: resumeJob
+      x-kokoro-owner: kokoro-scheduler
+      x-kokoro-visibility: internal-owner
+      x-kokoro-stability: stable
+      x-kokoro-idempotency: required
+      x-kokoro-permission: service-token
       security:
         - serviceBearer: []
       parameters:

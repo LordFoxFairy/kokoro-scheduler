@@ -1,5 +1,11 @@
 # kokoro-scheduler API Contract v1
 
+The canonical machine source is
+[`../contract/openapi/v1/openapi.yaml`](../contract/openapi/v1/openapi.yaml);
+owner, version, generation, breaking, and provenance policy is in
+[`../contract/README.md`](../contract/README.md). This document explains
+runtime semantics and is not a second wire source.
+
 ## 1. Boundary
 
 `kokoro-scheduler` is a Go infrastructure service. Its v1 runtime inputs are
@@ -37,6 +43,12 @@ POST   /internal/scheduler/v1/jobs/{name}/resume   resume future occurrences
 
 `{name}` must match `[a-z0-9][a-z0-9._-]{0,63}`. The routes are internal
 only and are not exposed through the public BFF user API.
+
+Every operation declares the five Kokoro governance extensions. Their v1
+vocabulary is: `owner=kokoro-scheduler`, `visibility=internal-owner`,
+`stability=stable`, `idempotency=inherent|required`, and
+`permission=none|service-token`. `service-token` describes the implemented
+shared Bearer boundary; it does not claim an IAM fine-grained permission check.
 
 ### Authentication and request metadata
 
@@ -87,7 +99,7 @@ Successful responses use `200` and the following shape:
 
 ```json
 {
-  "data": { "job": { "name": "billing.reconcile" }, "status": "registered" },
+  "data": { "job": { "name": "maintenance.reconcile" }, "status": "registered" },
   "meta": { "request_id": "req_scheduler_register_1" }
 }
 ```
@@ -230,14 +242,49 @@ error categories are:
 | `SCHEDULER_TARGET_REJECTED` | Target returned a non-success HTTP response |
 | `SCHEDULER_RETRY_JITTER_UNAVAILABLE` | The process random source failed before a retry delay could be selected |
 | `SCHEDULER_MISFIRED` | Recovery trigger was discarded by `misfire_policy=skip` |
+| `SCHEDULER_PAUSED` | The current registry state suppresses this occurrence |
+| `SCHEDULER_STALE_TRIGGER` | A removed or updated cron closure no longer matches the current job |
+| `SCHEDULER_OCCURRENCE_ALREADY_CLAIMED` | Another scheduler instance holds the occurrence lease |
+| `SCHEDULER_CANCELLED` | Process, caller, shutdown, or lease-loss cancellation stopped the occurrence |
 
-## 6. Verification
+## 6. Consumer integration boundary
+
+The BFF owns business `ScheduledTask` definitions, authorization, durable
+mutation receipts, and user-facing projection. Its Scheduler adapter may map a
+business scheduling intent to this service's generic `ScheduleJob`; that
+mapping does not transfer ownership of the business resource.
+
+Consumer requirements:
+
+1. Send register/update/delete/pause/resume with
+   `Authorization: Bearer <SCHEDULER_INTERNAL_SERVICE_TOKEN>`, a canonical
+   `X-Request-Id`, and a mutation `Idempotency-Key`.
+2. Preserve one business mutation identity across retries. The Scheduler's
+   process-local replay is an optimization; the consumer must retain the
+   registration intent across Scheduler restarts.
+3. Supply only a reviewed internal command URL and opaque JSON body. The
+   destination owner validates service identity, tenant scope, permission,
+   payload, and its own business state.
+4. The destination persists a durable receipt for the Scheduler dispatch
+   `Idempotency-Key`; Redis lease is not that receipt.
+5. Propagate and validate all retry fields, including
+   `max_backoff_seconds` and `max_retry_window_seconds`.
+6. Configure `SCHEDULER_TARGET_SERVICE_TOKEN` when the target contract requires
+   Bearer service authentication; never place end-user credentials in a job.
+7. After restart, replay every still-effective registration because the
+   Scheduler registry is intentionally process-local.
+
+The Scheduler has no SSE, AG-UI, browser, OAuth, cursor pagination, or public
+error surface. Those remain with BFF or the target fact owner.
+
+## 7. Verification
 
 ```bash
 gofmt -l .
 go test ./...
 go vet ./...
 go build ./cmd/scheduler
+go test ./internal/architecture ./internal/transport/http
 ```
 
 The contract tests cover strict configuration parsing, retry boundaries,

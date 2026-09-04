@@ -1,6 +1,7 @@
 # kokoro-scheduler
 
-技术方案：[docs/technical-architecture.md](docs/technical-architecture.md)；文档索引：[docs/INDEX.md](docs/INDEX.md)。
+代码地图：[INDEX.md](INDEX.md)；当前状态：[docs/CURRENT.md](docs/CURRENT.md)；技术设计：
+[docs/TECHNICAL_DESIGN.md](docs/TECHNICAL_DESIGN.md)；文档索引：[docs/INDEX.md](docs/INDEX.md)。
 
 通用定时任务子仓库，只负责通用调度配置与 HTTP 触发，不包含 Billing、Payment、Credit 业务逻辑。多实例模式可选连接共享 Redis，仅用于 occurrence claim；本仓 v1 不需要 PostgreSQL，因为任务 registry 只在进程内存中维护，业务执行事实由目标业务仓库写入 PostgreSQL。
 
@@ -25,8 +26,8 @@ BFF 可通过受保护的 internal HTTP command surface 注册、更新、暂停
 `ScheduleJob`；该 surface 仍只操作 scheduler 内存中的通用任务，不创建或持久化业务
 `ScheduledTask`。
 
-机器可审查的唯一 HTTP 契约位于 `contract/openapi/v1/openapi.yaml`；`docs/API_CONTRACT.md` 只解释
-运行语义，不另建一份可编辑 wire source。
+机器可审查的唯一 HTTP 契约位于 `contract/openapi/v1/openapi.yaml`；`contract/README.md` 记录 owner、
+version 与 provenance；`docs/API_CONTRACT.md` 只解释运行语义，不另建一份可编辑 wire source。
 
 调度核心直接复用成熟的 [`robfig/cron/v3`](https://github.com/robfig/cron)，支持标准 cron 表达式和 `@every`。
 任务由 `SCHEDULER_JOBS_JSON` 注入：
@@ -34,7 +35,15 @@ BFF 可通过受保护的 internal HTTP command surface 注册、更新、暂停
 未设置、空字符串或仅包含空白字符的值均按空任务列表处理；也可以显式配置 `[]`。
 
 ```json
-[{"name":"billing.reconcile","schedule":"@every 1h","url":"http://service.internal/commands/reconcile","method":"POST","body":{"tenantId":"TENANT"}}]
+[
+  {
+    "name": "maintenance.reconcile",
+    "schedule": "@every 1h",
+    "url": "http://service.internal/internal/commands/reconcile",
+    "method": "POST",
+    "body": {"scope": "scheduled"}
+  }
+]
 ```
 
 每个任务由 `name/schedule/url/method/body/retry/misfire_policy/paused` 组成；配置使用严格 JSON 解码，未知字段、越界 retry 值和非法 cron 表达式会在启动时失败。retry policy 使用带最大单次延迟和最大总窗口的 capped exponential backoff + full jitter；默认值为 `max_attempts=1`、`backoff_seconds=1`、`max_backoff_seconds=3600`、`max_retry_window_seconds=3600`。

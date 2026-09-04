@@ -41,5 +41,5 @@ Scheduler availability 错误；网络错误、timeout、lease failure、Schedul
 | Readiness loss | 同 deployment 超过 20% 实例连续 5 分钟 not-ready | 停止 rollout，检查 Redis 与 scheduler lifecycle |
 | Shutdown timeout | 任一实例超过 10 秒 | 检查 hanging dispatch/lease renewal，并阻止继续 rollout |
 
-处置步骤、诊断命令和回滚边界见 [runbook](./runbook.md)。PrometheusRule/dashboard 由部署 owner 根据这些
+处置步骤、诊断命令和回滚边界见 [RUNBOOK](./RUNBOOK.md)。PrometheusRule/dashboard 由部署 owner 根据这些
 稳定指标名实现并执行告警规则测试；实现缺失时不得把本文件视为已具备监控能力。
