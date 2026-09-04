@@ -57,6 +57,13 @@ dispatch 增加 `Authorization: Bearer <token>`；仅当目标服务契约不要
 服务负责持久化幂等 receipt 和业务状态。单实例不需要 Redis；多实例请配置
 `SCHEDULER_REDIS_URL`，用于同一 occurrence 的跨实例 claim。
 
+默认只允许解析到 global-unicast 的 target。需要访问本地 BFF 或受信内网时，部署可配置严格的
+`SCHEDULER_INTERNAL_TARGET_ALLOWLIST` JSON 数组，例如
+`[{"host":"service.internal","cidrs":["10.0.0.7/32"]}]`。每项必须是精确 DNS host 和 canonical
+private/loopback/IPv6 ULA CIDR；配置存在时仅列出的 host/CIDR pair 可出站，未列出的私网、loopback 和
+其他地址仍被拒绝。解析只执行一次并 pin 地址，仍禁止 redirect，response body 上限为 1 MiB，单次调用受
+overall timeout 限制。
+
 完整契约见：[API_CONTRACT.md](docs/API_CONTRACT.md)。
 
 ## Internal HTTP server

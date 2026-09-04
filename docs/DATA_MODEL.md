@@ -19,7 +19,7 @@
 |---|---|---|---|
 | `name` | `string` | `[a-z0-9][a-z0-9._-]{0,63}`，registry 内唯一 | 进程内 |
 | `schedule` | `string` | 有效标准 cron 或 `@every`；UTC 解释 | 进程内 |
-| `url` | `string` | 必须是有 host 的 `http`/`https` URL，无 userinfo/fragment，端口为 1–65535；literal 与 dispatch 时解析到的地址均不得为 localhost、loopback、未指定、私有、链路本地、组播或特殊/保留网段 | 进程内 |
+| `url` | `string` | 必须是有 host 的 `http`/`https` URL，无 userinfo/fragment，端口为 1–65535；literal 地址始终不得为 localhost、loopback、未指定、私有、链路本地、组播或特殊/保留网段；配置 `SCHEDULER_INTERNAL_TARGET_ALLOWLIST` 时仅精确列出的 resolved hostname/CIDR pair 可覆盖 private/loopback 拒绝 | 进程内 |
 | `method` | `Method` | `POST` 或 `PUT`；默认 `POST` | 进程内 |
 | `body` | `json.RawMessage` | JSON object；规范化为 canonical compact JSON；默认 `{}` | 进程内 |
 | `retry` | `RetryPolicy` | 见下表 | 进程内 |

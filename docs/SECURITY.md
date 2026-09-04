@@ -37,7 +37,7 @@ IAM fine-grained permission。探针使用 `x-kokoro-permission: none`。
 ## 3. Outbound dispatch controls
 
 - URL validation 只允许有 host 的 `http` / `https`，拒绝 embedded credentials、fragment、异常端口、localhost、loopback、未指定、私有、链路本地、组播和特殊/保留 IP。
-- hostname target 在每次 dispatch 前只解析一次；所有答案先经过地址策略，随后将选中的地址固定到本次请求 URL，同时保留原 Host/HTTPS server name，避免 validation 与实际连接之间的 DNS TOCTOU。默认不启用 allowlist；注入的 `(host, address)` allowlist 只能进一步收窄已允许的全局地址。
+- hostname target 在每次 dispatch 前只解析一次；地址先经过策略，随后将选中的地址固定到本次请求 URL，同时保留原 Host/HTTPS server name，避免 validation 与实际连接之间的 DNS TOCTOU。默认拒绝 private/loopback 等特殊地址；配置 `SCHEDULER_INTERNAL_TARGET_ALLOWLIST` 后，只有精确声明的 `(host, internal CIDR)` pair 才能覆盖该默认拒绝，未列入的地址仍拒绝。
 - HTTP client 禁止自动跟随 redirect；目标 response body 读取上限为 1 MiB。
 - method 只允许 `POST` / `PUT`，body 必须是 JSON object。
 - `SCHEDULER_TARGET_SERVICE_TOKEN` 与 inbound token 分离；非空时只写入 `Authorization` header，不写日志。
@@ -46,9 +46,10 @@ IAM fine-grained permission。探针使用 `x-kokoro-permission: none`。
 - context cancellation 与 30 秒 overall timeout 限制单次请求时长；目标 4xx 不重试，429/5xx/网络错误受
   attempt 与时间窗口双重约束。
 
-当前进程不提供可配置的 hostname/CIDR allowlist；默认地址策略拒绝特殊网段，生产部署仍必须通过受审配置、DNS/egress
-network policy 和目标服务认证把 dispatch 限制在内部 endpoint。任何允许修改 ScheduleJob 的 caller 都等价于
-拥有创建出站请求的能力，必须保持在受信服务边界内。
+`SCHEDULER_INTERNAL_TARGET_ALLOWLIST` 是严格 JSON 数组，host 不支持 wildcard，CIDR 必须 canonical 且只能
+落在 RFC1918、loopback 或 IPv6 ULA；配置存在时切换为 allowlist-only 地址策略，便于审计实际可达的内部
+目标。生产部署仍必须通过受审配置、DNS/egress network policy 和目标服务认证把 dispatch 限制在内部 endpoint。
+任何允许修改 ScheduleJob 的 caller 都等价于拥有创建出站请求的能力，必须保持在受信服务边界内。
 
 ## 4. Secret 与日志
 

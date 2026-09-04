@@ -132,6 +132,20 @@ func TestClientRejectsDNSResolvedPrivateTargetBeforeDial(t *testing.T) {
 	}
 }
 
+func TestClientAllowsExplicitlyAllowlistedPrivateTarget(t *testing.T) {
+	resolver := &fixedResolver{addresses: []netip.Addr{netip.MustParseAddr("10.0.0.7")}}
+	client := NewClientWithResolver(&http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusAccepted, Body: http.NoBody, Header: make(http.Header), Request: request}, nil
+	})}, "", resolver, AddressAllowlistFunc(func(host string, address netip.Addr) bool {
+		return host == "service.test" && address == netip.MustParseAddr("10.0.0.7")
+	}))
+	job := domain.Job{Name: "allowlisted-private", Schedule: "@every 1m", URL: "http://service.test/command", Method: "POST", Body: []byte(`{}`), Retry: domain.RetryPolicy{MaxAttempts: 1}}
+	result := client.Dispatch(context.Background(), job, domain.NewOccurrence(job.Name, time.Now(), time.Now()))
+	if result.Err != nil || result.Status != http.StatusAccepted {
+		t.Fatalf("allowlisted private result = %#v, want accepted", result)
+	}
+}
+
 func TestClientPinsResolvedAddressWhilePreservingHTTPHost(t *testing.T) {
 	resolver := &fixedResolver{addresses: []netip.Addr{netip.MustParseAddr("93.184.216.34")}}
 	var gotURLHost, gotHost string

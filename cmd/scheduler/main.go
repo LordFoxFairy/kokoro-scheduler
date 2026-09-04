@@ -82,13 +82,17 @@ func main() {
 		defer redisClient.Close()
 	}
 
+	var targetAllowlist httpclient.AddressAllowlist
+	if cfg.InternalTargetAllowlist != nil {
+		targetAllowlist = cfg.InternalTargetAllowlist
+	}
 	scheduler, err := application.NewScheduler(application.Dependencies{
 		Engine:          cronadapter.NewEngine(),
 		Clock:           ports.SystemClock{},
 		Sleeper:         system.Sleeper{},
 		Random:          system.CryptoRandomSource{},
 		LeaseStore:      leaseStore,
-		TargetClient:    httpclient.NewDefaultClient(cfg.DispatchTimeout, cfg.TargetServiceToken),
+		TargetClient:    httpclient.NewDefaultClientWithAllowlist(cfg.DispatchTimeout, cfg.TargetServiceToken, targetAllowlist),
 		Observer:        logObserver{logger: logger},
 		DispatchTimeout: cfg.DispatchTimeout,
 		LeaseTTL:        cfg.LeaseTTL,

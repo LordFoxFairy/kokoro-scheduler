@@ -72,6 +72,10 @@ func NewClientWithResolver(httpClient *http.Client, targetServiceToken string, r
 }
 
 func NewDefaultClient(timeout time.Duration, targetServiceToken string) *Client {
+	return NewDefaultClientWithAllowlist(timeout, targetServiceToken, nil)
+}
+
+func NewDefaultClientWithAllowlist(timeout time.Duration, targetServiceToken string, allowlist AddressAllowlist) *Client {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
@@ -86,7 +90,7 @@ func NewDefaultClient(timeout time.Duration, targetServiceToken string) *Client 
 		ResponseHeaderTimeout: timeout,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
-	return NewClientWithResolver(&http.Client{Transport: transport, Timeout: timeout}, targetServiceToken, net.DefaultResolver, nil)
+	return NewClientWithResolver(&http.Client{Transport: transport, Timeout: timeout}, targetServiceToken, net.DefaultResolver, allowlist)
 }
 
 func (c *Client) Dispatch(ctx context.Context, job domain.Job, occurrence domain.Occurrence) domain.RunResult {
@@ -187,11 +191,18 @@ func (c *Client) resolveTarget(ctx context.Context, rawURL string) (*url.URL, ne
 	}
 	for _, address := range addresses {
 		address = address.Unmap()
-		if domain.IsSafeTargetAddress(address) && (c.allowlist == nil || c.allowlist.Allows(hostname, address)) {
+		if c.targetAddressAllowed(hostname, address) {
 			return parsedURL, address, nil
 		}
 	}
 	return nil, netip.Addr{}, fmt.Errorf("%w: target resolved to a disallowed IP address", errTargetRejected)
+}
+
+func (c *Client) targetAddressAllowed(hostname string, address netip.Addr) bool {
+	if c.allowlist != nil {
+		return c.allowlist.Allows(hostname, address)
+	}
+	return domain.IsSafeTargetAddress(address)
 }
 
 func (c *Client) doResolved(request *http.Request, serverName string) (*http.Response, error) {

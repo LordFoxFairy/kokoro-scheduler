@@ -24,6 +24,15 @@ truth.
 If `SCHEDULER_JOBS_JSON` is unset, empty, or contains only whitespace, it is
 treated as an empty job list (`[]`).
 
+Outbound target policy defaults to rejecting private/loopback and other
+special-use addresses. Deployments that need local BFF or trusted internal
+targets may set `SCHEDULER_INTERNAL_TARGET_ALLOWLIST` to a strict JSON array of
+exact host and canonical internal CIDR pairs, for example
+`[{"host":"service.internal","cidrs":["10.0.0.7/32"]}]`. A configured policy
+allows only declared pairs; wildcard hosts, public/special-use CIDRs, duplicate
+entries, DNS rebinding, redirects, oversized responses, and timeouts remain
+rejected.
+
 The scheduler has no public resource CRUD endpoint, cursor pagination, OAuth
 user surface, SSE stream, or user-facing API. The target business command owns
 those concerns; scheduler-side receipts are callback/log records with the
@@ -125,7 +134,7 @@ The JSON array contains `ScheduleJob` resources:
 |---|---|---:|---|
 | `name` | string | yes | Stable `[a-z0-9][a-z0-9._-]{0,63}` identifier; unique in one deployment |
 | `schedule` | string | yes | UTC standard cron expression or `@every <duration>` |
-| `url` | string | yes | Absolute `http`/`https` command endpoint; no credentials or fragment; port must be 1–65535; literal and resolved addresses must not be localhost, loopback, unspecified, private, link-local, multicast, or special-use/reserved ranges |
+| `url` | string | yes | Absolute `http`/`https` command endpoint; no credentials or fragment; port must be 1–65535; literal addresses and resolved addresses must not be localhost, loopback, unspecified, private, link-local, multicast, or special-use/reserved ranges; a resolved hostname/address pair may override private/loopback rejection only when explicitly declared by `SCHEDULER_INTERNAL_TARGET_ALLOWLIST` |
 | `method` | string | no | `POST` or `PUT`; default `POST` |
 | `body` | object | no | JSON command payload; default `{}` |
 | `retry.max_attempts` | integer | no | 1–10; default `1` |
@@ -199,9 +208,10 @@ Before dispatch, the scheduler resolves a hostname once and pins one permitted
 answer into the request connection while preserving the original HTTP Host
 and HTTPS certificate name. It never follows redirects automatically, and it
 reads at most 1 MiB of target response body. A resolver failure is a transient
-target-unavailable result; an unsafe literal or resolved address is rejected
-without dialing. The optional adapter allowlist can narrow permitted
-`(hostname, resolved address)` pairs and does not permit special-use ranges.
+target-unavailable result; an unsafe literal is rejected without dialing, and
+an unsafe resolved address is rejected unless it matches the explicit internal
+allowlist. A configured allowlist is allowlist-only for the resolved
+`(hostname, address)` pair.
 
 `X-Kokoro-Scheduler-Occurrence` is the stable occurrence identity, formatted
 as the scheduled occurrence timestamp in UTC (`YYYYMMDDTHHMMSSZ`). It is

@@ -36,6 +36,7 @@ go run ./cmd/scheduler
 | `SCHEDULER_HTTP_ADDR` | listener，默认 `:8080` | bind 失败触发 shutdown |
 | `SCHEDULER_INTERNAL_SERVICE_TOKEN` | inbound job command Bearer | 为空时所有 command 401，探针仍可用 |
 | `SCHEDULER_TARGET_SERVICE_TOKEN` | outbound target Bearer | 为空时不发送 Authorization |
+| `SCHEDULER_INTERNAL_TARGET_ALLOWLIST` | exact internal hostname/CIDR override | 非空时只允许声明的 canonical private/loopback/IPv6 ULA pair；JSON、host 或 CIDR 非法则启动退出 |
 | `SCHEDULER_HEALTHCHECK_URL` | healthcheck 子命令的 readiness URL | 2 秒内非 200 则 healthcheck 失败 |
 
 完整字段和 retry 边界见 [`API_CONTRACT.md`](./API_CONTRACT.md)。
