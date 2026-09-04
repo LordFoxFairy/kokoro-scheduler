@@ -2,16 +2,22 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
-	"github.com/LordFoxFairy/kokoro-scheduler/internal/adapters/cron"
+	gocronadapter "github.com/LordFoxFairy/kokoro-scheduler/internal/adapters/gocron"
 	"github.com/LordFoxFairy/kokoro-scheduler/internal/adapters/httpclient"
+	postgresadapter "github.com/LordFoxFairy/kokoro-scheduler/internal/adapters/postgres"
+	"github.com/LordFoxFairy/kokoro-scheduler/internal/adapters/recurrence"
 	redisadapter "github.com/LordFoxFairy/kokoro-scheduler/internal/adapters/redis"
 	"github.com/LordFoxFairy/kokoro-scheduler/internal/adapters/system"
 	"github.com/LordFoxFairy/kokoro-scheduler/internal/application"
@@ -19,33 +25,40 @@ import (
 	"github.com/LordFoxFairy/kokoro-scheduler/internal/domain"
 	"github.com/LordFoxFairy/kokoro-scheduler/internal/ports"
 	transporthttp "github.com/LordFoxFairy/kokoro-scheduler/internal/transport/http"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
 
 type logObserver struct{ logger *slog.Logger }
 
-func (o logObserver) Observe(job domain.Job, result domain.RunResult) {
+func (o logObserver) Observe(work domain.DispatchWork, result domain.DispatchResult) {
 	outcome := "succeeded"
 	if !result.Succeeded() {
 		outcome = "failed"
 	}
 	args := []any{
 		"operation", "dispatch",
-		"job", job.Name,
+		"tenant_id", work.TenantID,
+		"schedule", work.ScheduleName,
 		"result", outcome,
 		"status", result.Status,
-		"attempts", result.Attempts,
+		"attempt", work.AttemptCount,
 		"code", result.Code,
 		"request_id", result.RequestID,
 		"trace_id", result.TraceID,
 		"duration_ms", result.Duration.Milliseconds(),
 	}
 	if result.Err != nil {
-		args = append(args, "error", result.Err.Error())
-		o.logger.Error("scheduler dispatch failed", args...)
+		o.logger.Error("scheduler dispatch failed", append(args, "error", result.Err.Error())...)
 		return
 	}
 	o.logger.Info("scheduler dispatch completed", args...)
+}
+
+type logErrorObserver struct{ logger *slog.Logger }
+
+func (o logErrorObserver) ObserveError(operation string, err error) {
+	o.logger.Error("scheduler background operation failed", "operation", operation, "error", err.Error())
 }
 
 func main() {
@@ -55,64 +68,87 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})).With(
 		"service", "kokoro-scheduler",
 	)
-	cfg, err := config.Load(os.Getenv)
-	if err != nil {
-		logger.Error("scheduler startup failed", "error", err.Error())
+	if err := run(logger); err != nil {
+		logger.Error("scheduler stopped with an error", "error", err.Error())
 		os.Exit(1)
 	}
+}
 
-	var redisClient *redis.Client
-	var leaseStore ports.LeaseStore
-	if cfg.RedisURL != "" {
-		options, parseErr := redis.ParseURL(cfg.RedisURL)
-		if parseErr != nil {
-			logger.Error("parse scheduler redis url failed", "env", config.RedisURLEnv, "error", parseErr.Error())
-			os.Exit(1)
-		}
-		redisClient = redis.NewClient(options)
-		pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		pingErr := redisClient.Ping(pingCtx).Err()
-		cancel()
-		if pingErr != nil {
-			_ = redisClient.Close()
-			logger.Error("scheduler Redis coordination is unavailable", "error", pingErr.Error())
-			os.Exit(1)
-		}
-		leaseStore = redisadapter.NewStore(redisClient, 2*time.Second)
+func run(logger *slog.Logger) error {
+	cfg, err := config.Load(os.Getenv)
+	if err != nil {
+		return fmt.Errorf("load scheduler configuration: %w", err)
+	}
+	startupCtx, startupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer startupCancel()
+	pool, err := pgxpool.New(startupCtx, cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("open scheduler PostgreSQL store: %w", err)
+	}
+	defer pool.Close()
+	store := postgresadapter.NewStore(pool)
+	if err := store.Ping(startupCtx); err != nil {
+		return fmt.Errorf("ping scheduler PostgreSQL store: %w", err)
+	}
+
+	redisClient, leaseStore, err := openRedis(startupCtx, cfg.RedisURL)
+	if err != nil {
+		return err
+	}
+	if redisClient != nil {
 		defer redisClient.Close()
 	}
 
+	workerID, err := resolveWorkerID(cfg.WorkerID)
+	if err != nil {
+		return err
+	}
+	calculator := recurrence.NewCalculator()
+	service, err := application.NewService(store, ports.SystemClock{}, calculator)
+	if err != nil {
+		return err
+	}
+	planner, err := application.NewPlanner(store, ports.SystemClock{}, calculator, workerID, cfg.ClaimTTL, cfg.BatchSize)
+	if err != nil {
+		return err
+	}
 	var targetAllowlist httpclient.AddressAllowlist
 	if cfg.InternalTargetAllowlist != nil {
 		targetAllowlist = cfg.InternalTargetAllowlist
 	}
-	scheduler, err := application.NewScheduler(application.Dependencies{
-		Engine:          cronadapter.NewEngine(),
-		Clock:           ports.SystemClock{},
-		Sleeper:         system.Sleeper{},
-		Random:          system.CryptoRandomSource{},
-		LeaseStore:      leaseStore,
-		TargetClient:    httpclient.NewDefaultClientWithAllowlist(cfg.DispatchTimeout, cfg.TargetServiceToken, targetAllowlist),
-		Observer:        logObserver{logger: logger},
-		DispatchTimeout: cfg.DispatchTimeout,
-		LeaseTTL:        cfg.LeaseTTL,
+	dispatcher, err := application.NewDispatcher(application.DispatcherDependencies{
+		Store: store, Clock: ports.SystemClock{}, Random: system.CryptoRandomSource{},
+		Target:     httpclient.NewDefaultClientWithAllowlist(cfg.DispatchTimeout, cfg.TargetServiceToken, targetAllowlist),
+		LeaseStore: leaseStore, Observer: logObserver{logger: logger}, WorkerID: workerID,
+		ClaimTTL: cfg.ClaimTTL, DispatchTimeout: cfg.DispatchTimeout, BatchSize: cfg.BatchSize,
 	})
 	if err != nil {
-		logger.Error("scheduler startup failed", "error", err.Error())
-		os.Exit(1)
+		return err
 	}
-	for _, job := range cfg.Jobs {
-		if err := scheduler.Register(job); err != nil {
-			logger.Error("register scheduler job failed", "job", job.Name, "error", err.Error())
-			os.Exit(1)
-		}
+	processor, err := application.NewProcessor(planner, dispatcher)
+	if err != nil {
+		return err
+	}
+	wakeup, err := gocronadapter.NewWakeup(cfg.WakeupInterval)
+	if err != nil {
+		return err
+	}
+	runtime, err := application.NewRuntime(wakeup, processor, logErrorObserver{logger: logger})
+	if err != nil {
+		return err
+	}
+	if err := runtime.Start(); err != nil {
+		return fmt.Errorf("start scheduler wakeup adapter: %w", err)
 	}
 
 	server := &http.Server{
 		Addr: cfg.HTTPAddr,
-		Handler: transporthttp.NewHTTPHandler(scheduler, cfg.InternalServiceToken, func(ctx context.Context) error {
-			if !scheduler.Ready() {
-				return errors.New("scheduler is not running")
+		Handler: transporthttp.NewHTTPHandler(service, cfg.InternalServiceToken, func(ctx context.Context) error {
+			if !runtime.Ready() {
+				return errors.New("scheduler runtime is not accepting work")
+			}
+			if err := store.Ping(ctx); err != nil {
+				return err
 			}
 			if redisClient != nil {
 				return redisClient.Ping(ctx).Err()
@@ -126,30 +162,59 @@ func main() {
 	}
 	serverErrors := make(chan error, 1)
 	go func() {
-		logger.Info("scheduler HTTP server listening", "addr", cfg.HTTPAddr)
+		logger.Info("scheduler HTTP server listening", "addr", cfg.HTTPAddr, "worker_id", workerID)
 		if serveErr := server.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 			serverErrors <- serveErr
 		}
 	}()
-	scheduler.Start()
-	logger.Info("scheduler started", "jobs", len(cfg.Jobs))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	var serveErr error
 	select {
 	case <-ctx.Done():
-	case serveErr := <-serverErrors:
-		logger.Error("scheduler HTTP server failed", "error", serveErr.Error())
+	case serveErr = <-serverErrors:
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		logger.Error("scheduler HTTP shutdown failed", "error", err.Error())
+	serverErr := server.Shutdown(shutdownCtx)
+	runtimeErr := runtime.Stop(shutdownCtx)
+	return errors.Join(serveErr, serverErr, runtimeErr)
+}
+
+func openRedis(ctx context.Context, rawURL string) (*redis.Client, ports.LeaseStore, error) {
+	if strings.TrimSpace(rawURL) == "" {
+		return nil, nil, nil
 	}
-	if err := scheduler.Stop(shutdownCtx); err != nil {
-		logger.Error("scheduler shutdown failed", "error", err.Error())
+	options, err := redis.ParseURL(rawURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse scheduler Redis URL: %w", err)
 	}
+	if options.DB != 7 {
+		return nil, nil, errors.New("scheduler Redis URL must select logical DB 7")
+	}
+	client := redis.NewClient(options)
+	if err := client.Ping(ctx).Err(); err != nil {
+		_ = client.Close()
+		return nil, nil, fmt.Errorf("ping scheduler Redis coordination: %w", err)
+	}
+	return client, redisadapter.NewStore(client, 2*time.Second), nil
+}
+
+func resolveWorkerID(configured string) (string, error) {
+	if configured = strings.TrimSpace(configured); configured != "" {
+		return configured, nil
+	}
+	hostname, err := os.Hostname()
+	if err != nil {
+		return "", fmt.Errorf("resolve scheduler worker hostname: %w", err)
+	}
+	var suffix [8]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		return "", fmt.Errorf("generate scheduler worker identity: %w", err)
+	}
+	return hostname + "-" + hex.EncodeToString(suffix[:]), nil
 }
 
 func runHealthcheck() int {

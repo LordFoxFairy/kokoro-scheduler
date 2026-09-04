@@ -9,15 +9,15 @@ import (
 	"github.com/LordFoxFairy/kokoro-scheduler/internal/domain"
 )
 
-func parseJobPath(path string) (name, action string, ok bool) {
-	if !strings.HasPrefix(path, JobsPathPrefix) {
+func parseSchedulePath(path string) (name, action string, ok bool) {
+	if !strings.HasPrefix(path, SchedulesPathPrefix) {
 		return "", "", false
 	}
-	parts := strings.Split(strings.TrimPrefix(path, JobsPathPrefix), "/")
-	if len(parts) == 1 && domain.IsValidName(parts[0]) {
+	parts := strings.Split(strings.TrimPrefix(path, SchedulesPathPrefix), "/")
+	if len(parts) == 1 && domain.IsValidScheduleName(parts[0]) {
 		return parts[0], "", true
 	}
-	if len(parts) == 2 && domain.IsValidName(parts[0]) && (parts[1] == "pause" || parts[1] == "resume") {
+	if len(parts) == 2 && domain.IsValidScheduleName(parts[0]) && (parts[1] == "pause" || parts[1] == "resume") {
 		return parts[0], parts[1], true
 	}
 	return "", "", false
@@ -41,7 +41,7 @@ func validateRequestID(requestID string) error {
 	if requestID == "" {
 		return errors.New("X-Request-Id is required")
 	}
-	if len(requestID) > 128 || strings.IndexFunc(requestID, func(character rune) bool { return character < 0x20 || character == 0x7f }) >= 0 {
+	if len(requestID) > 128 || strings.IndexFunc(requestID, controlCharacter) >= 0 {
 		return errors.New("X-Request-Id is invalid")
 	}
 	return nil
@@ -51,7 +51,7 @@ func validateIdempotencyKey(key string) error {
 	if key == "" {
 		return errors.New("Idempotency-Key is required")
 	}
-	if len(key) > 256 || strings.ContainsAny(key, "\r\n") {
+	if len(key) > 256 || strings.IndexFunc(key, controlCharacter) >= 0 {
 		return errors.New("Idempotency-Key is invalid")
 	}
 	return nil
@@ -61,3 +61,5 @@ func isJSONContentType(value string) bool {
 	mediaType, _, err := mime.ParseMediaType(value)
 	return err == nil && strings.EqualFold(mediaType, "application/json")
 }
+
+func controlCharacter(character rune) bool { return character < 0x20 || character == 0x7f }

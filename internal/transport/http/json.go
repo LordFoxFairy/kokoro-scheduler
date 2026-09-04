@@ -12,14 +12,17 @@ import (
 	"github.com/LordFoxFairy/kokoro-scheduler/internal/domain"
 )
 
-type jobRequest struct {
+type scheduleRequest struct {
 	Name          string          `json:"name"`
 	Schedule      string          `json:"schedule"`
+	Timezone      string          `json:"timezone"`
 	URL           string          `json:"url"`
 	Method        string          `json:"method"`
 	Body          json.RawMessage `json:"body"`
 	Retry         *retryRequest   `json:"retry"`
 	MisfirePolicy string          `json:"misfire_policy"`
+	CatchUpLimit  int             `json:"catch_up_limit"`
+	OverlapPolicy string          `json:"overlap_policy"`
 	Paused        bool            `json:"paused"`
 }
 
@@ -53,34 +56,40 @@ func (r *retryRequest) toDomain() (domain.RetryPolicy, error) {
 	return policy, nil
 }
 
-func (r jobRequest) toDomain(pathName string) (domain.Job, error) {
+func (r scheduleRequest) toDomain(tenantID, pathName string) (domain.Schedule, error) {
 	if r.Name == "" {
 		r.Name = pathName
 	} else if r.Name != pathName {
-		return domain.Job{}, errors.New("job name must match the path")
+		return domain.Schedule{}, errors.New("schedule name must match the path")
 	}
 	retry, err := r.Retry.toDomain()
 	if err != nil {
-		return domain.Job{}, err
+		return domain.Schedule{}, err
 	}
-	return domain.Job{
-		Name: r.Name, Schedule: r.Schedule, URL: r.URL, Method: domain.Method(r.Method), Body: r.Body,
-		Retry:         retry,
-		MisfirePolicy: domain.MisfirePolicy(r.MisfirePolicy), Paused: r.Paused,
-	}.Normalized()
+	status := domain.ScheduleActive
+	if r.Paused {
+		status = domain.SchedulePaused
+	}
+	return (domain.Schedule{
+		TenantID: tenantID, Name: r.Name, Rule: r.Schedule, Timezone: r.Timezone,
+		TargetURL: r.URL, Method: domain.Method(r.Method), Payload: r.Body,
+		Retry: retry, MisfirePolicy: domain.MisfirePolicy(r.MisfirePolicy),
+		CatchUpLimit: r.CatchUpLimit, OverlapPolicy: domain.OverlapPolicy(r.OverlapPolicy),
+		Status: status,
+	}).Normalized()
 }
 
 var (
 	errUnsupportedMediaType = errors.New("Content-Type must be application/json")
 	errInvalidAction        = errors.New("action body must be an empty JSON object")
 	errInvalidDelete        = errors.New("delete body must be an empty JSON object")
-	errInvalidJob           = errors.New("invalid scheduler job")
+	errInvalidSchedule      = errors.New("invalid scheduler schedule")
 )
 
-func decodePayload(r *http.Request, pathName, action string) (domain.Job, []byte, error) {
+func decodePayload(r *http.Request, tenantID, pathName, action string) (domain.Schedule, []byte, error) {
 	body, err := readBody(r)
 	if err != nil {
-		return domain.Job{}, nil, err
+		return domain.Schedule{}, nil, err
 	}
 	if action != "" {
 		return emptyObjectPayload(body, errInvalidAction, r.Header.Get("Content-Type"))
@@ -89,66 +98,97 @@ func decodePayload(r *http.Request, pathName, action string) (domain.Job, []byte
 		return emptyObjectPayload(body, errInvalidDelete, r.Header.Get("Content-Type"))
 	}
 	if !isJSONContentType(r.Header.Get("Content-Type")) {
-		return domain.Job{}, nil, errUnsupportedMediaType
+		return domain.Schedule{}, nil, errUnsupportedMediaType
 	}
 	if len(body) == 0 {
-		return domain.Job{}, nil, errInvalidJob
+		return domain.Schedule{}, nil, errInvalidSchedule
 	}
 	if err := ensureNoDuplicateKeys(body); err != nil {
-		return domain.Job{}, nil, err
+		return domain.Schedule{}, nil, err
 	}
 	var raw map[string]json.RawMessage
 	if err := decodeSingleJSON(body, &raw); err != nil || raw == nil {
-		return domain.Job{}, nil, errInvalidJob
+		return domain.Schedule{}, nil, errInvalidSchedule
 	}
 	for key, value := range raw {
 		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
-			return domain.Job{}, nil, fmt.Errorf("job field %q must not be null", key)
+			return domain.Schedule{}, nil, fmt.Errorf("schedule field %q must not be null", key)
 		}
 	}
 	if retryBody, exists := raw["retry"]; exists {
 		var retryFields map[string]json.RawMessage
 		if err := decodeSingleJSON(retryBody, &retryFields); err != nil || retryFields == nil {
-			return domain.Job{}, nil, errors.New("job field \"retry\" must be a JSON object")
+			return domain.Schedule{}, nil, errors.New("schedule field \"retry\" must be a JSON object")
 		}
 		for key, value := range retryFields {
 			if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
-				return domain.Job{}, nil, fmt.Errorf("retry field %q must not be null", key)
+				return domain.Schedule{}, nil, fmt.Errorf("retry field %q must not be null", key)
 			}
 		}
 	}
-	var request jobRequest
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&request); err != nil {
-		return domain.Job{}, nil, fmt.Errorf("decode job: %w", err)
+	var request scheduleRequest
+	if err := decodeSingleJSON(body, &request); err != nil {
+		return domain.Schedule{}, nil, fmt.Errorf("decode schedule: %w", err)
 	}
-	normalized, err := request.toDomain(pathName)
-	if err != nil {
-		return domain.Job{}, nil, err
+	for field, value := range map[string]string{
+		"name": request.Name, "timezone": request.Timezone, "method": request.Method,
+		"misfire_policy": request.MisfirePolicy, "overlap_policy": request.OverlapPolicy,
+	} {
+		if _, provided := raw[field]; provided && strings.TrimSpace(value) == "" {
+			return domain.Schedule{}, nil, fmt.Errorf("schedule field %q must not be empty", field)
+		}
 	}
-	canonical, err := json.Marshal(normalized)
+	if _, provided := raw["catch_up_limit"]; provided && request.CatchUpLimit == 0 {
+		return domain.Schedule{}, nil, errors.New("schedule field \"catch_up_limit\" must be at least 1")
+	}
+	normalized, err := request.toDomain(tenantID, pathName)
 	if err != nil {
-		return domain.Job{}, nil, err
+		return domain.Schedule{}, nil, err
+	}
+	canonical, err := canonicalCommandPayload(normalized)
+	if err != nil {
+		return domain.Schedule{}, nil, err
 	}
 	return normalized, canonical, nil
 }
 
-func emptyObjectPayload(body []byte, invalid error, contentType string) (domain.Job, []byte, error) {
+func canonicalCommandPayload(schedule domain.Schedule) ([]byte, error) {
+	return json.Marshal(struct {
+		TenantID      string                `json:"tenant_id"`
+		Name          string                `json:"name"`
+		Schedule      string                `json:"schedule"`
+		Timezone      string                `json:"timezone"`
+		URL           string                `json:"url"`
+		Method        domain.Method         `json:"method"`
+		Body          json.RawMessage       `json:"body"`
+		Retry         domain.RetryPolicy    `json:"retry"`
+		MisfirePolicy domain.MisfirePolicy  `json:"misfire_policy"`
+		CatchUpLimit  int                   `json:"catch_up_limit"`
+		OverlapPolicy domain.OverlapPolicy  `json:"overlap_policy"`
+		Status        domain.ScheduleStatus `json:"status"`
+	}{
+		TenantID: schedule.TenantID, Name: schedule.Name, Schedule: schedule.Rule,
+		Timezone: schedule.Timezone, URL: schedule.TargetURL, Method: schedule.Method,
+		Body: schedule.Payload, Retry: schedule.Retry, MisfirePolicy: schedule.MisfirePolicy,
+		CatchUpLimit: schedule.CatchUpLimit, OverlapPolicy: schedule.OverlapPolicy, Status: schedule.Status,
+	})
+}
+
+func emptyObjectPayload(body []byte, invalid error, contentType string) (domain.Schedule, []byte, error) {
 	if len(body) == 0 {
-		return domain.Job{}, []byte(`{}`), nil
+		return domain.Schedule{}, []byte(`{}`), nil
 	}
 	if !isJSONContentType(contentType) {
-		return domain.Job{}, nil, errUnsupportedMediaType
+		return domain.Schedule{}, nil, errUnsupportedMediaType
 	}
 	if err := ensureNoDuplicateKeys(body); err != nil {
-		return domain.Job{}, nil, err
+		return domain.Schedule{}, nil, err
 	}
 	var object map[string]json.RawMessage
 	if err := decodeSingleJSON(body, &object); err != nil || object == nil || len(object) != 0 {
-		return domain.Job{}, nil, invalid
+		return domain.Schedule{}, nil, invalid
 	}
-	return domain.Job{}, []byte(`{}`), nil
+	return domain.Schedule{}, []byte(`{}`), nil
 }
 
 func readBody(r *http.Request) ([]byte, error) {
@@ -249,11 +289,11 @@ func decodeError(err error) (int, string, string) {
 	switch {
 	case errors.Is(err, errUnsupportedMediaType):
 		return http.StatusUnsupportedMediaType, "unsupported_media_type", err.Error()
-	case errors.Is(err, errInvalidAction), errors.Is(err, errInvalidDelete), errors.Is(err, errInvalidJob):
-		return http.StatusBadRequest, "invalid_job", err.Error()
+	case errors.Is(err, errInvalidAction), errors.Is(err, errInvalidDelete), errors.Is(err, errInvalidSchedule):
+		return http.StatusBadRequest, "invalid_schedule", err.Error()
 	case strings.Contains(err.Error(), "request body too large"):
 		return http.StatusRequestEntityTooLarge, "request_body_too_large", "request body is too large"
 	default:
-		return http.StatusBadRequest, "invalid_job", err.Error()
+		return http.StatusBadRequest, "invalid_schedule", err.Error()
 	}
 }

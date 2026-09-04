@@ -7,7 +7,6 @@ import (
 	"github.com/LordFoxFairy/kokoro-scheduler/internal/domain"
 )
 
-// Clock is injected so scheduling and retry decisions are deterministic in tests.
 type Clock interface {
 	Now() time.Time
 }
@@ -16,30 +15,21 @@ type SystemClock struct{}
 
 func (SystemClock) Now() time.Time { return time.Now().UTC() }
 
-// Sleeper makes retry delays context-aware and replaceable in deterministic tests.
-type Sleeper interface {
-	Wait(ctx context.Context, duration time.Duration) error
-}
-
-// RandomSource supplies an unbiased value in [0, maxExclusive). Production
-// adapters must not use a shared deterministic seed across scheduler instances.
 type RandomSource interface {
 	Int63n(maxExclusive int64) (int64, error)
 }
 
-// ScheduleEngine owns only timer registration. It never owns scheduler jobs.
-type ScheduleEngine interface {
-	Add(spec string, run func()) (EntryID, error)
-	Remove(id EntryID)
-	Start()
-	Stop(ctx context.Context) error
+type Recurrence interface {
+	Validate(rule, timezone string) error
+	Next(rule, timezone string, after time.Time) (time.Time, error)
+	NextAfter(rule, timezone string, anchor, threshold time.Time) (time.Time, error)
 }
 
-type EntryID int64
+type Wakeup interface {
+	Start(run func(context.Context)) error
+	Stop(context.Context) error
+}
 
-// LeaseStore is the cross-instance occurrence claim port. Successful
-// occurrences retain their claim for the configured TTL; failed occurrences
-// release their claim so a later retry or recovery loop can make progress.
 type LeaseStore interface {
 	Acquire(ctx context.Context, key string, ttl time.Duration) (Lease, bool, error)
 }
@@ -49,20 +39,32 @@ type Lease interface {
 	Release(ctx context.Context) error
 }
 
-// TargetClient dispatches a generic command to the owner service. It does not
-// know Billing, Agent, or any other business model.
 type TargetClient interface {
-	Dispatch(ctx context.Context, job domain.Job, occurrence domain.Occurrence) domain.RunResult
+	Dispatch(ctx context.Context, work domain.DispatchWork) domain.DispatchResult
 }
 
-type RunObserver interface {
-	Observe(job domain.Job, result domain.RunResult)
+type DispatchObserver interface {
+	Observe(work domain.DispatchWork, result domain.DispatchResult)
 }
 
-type RunObserverFunc func(domain.Job, domain.RunResult)
+type DispatchObserverFunc func(domain.DispatchWork, domain.DispatchResult)
 
-func (f RunObserverFunc) Observe(job domain.Job, result domain.RunResult) { f(job, result) }
+func (f DispatchObserverFunc) Observe(work domain.DispatchWork, result domain.DispatchResult) {
+	f(work, result)
+}
 
-type NoopObserver struct{}
+type NoopDispatchObserver struct{}
 
-func (NoopObserver) Observe(domain.Job, domain.RunResult) {}
+func (NoopDispatchObserver) Observe(domain.DispatchWork, domain.DispatchResult) {}
+
+type ErrorObserver interface {
+	ObserveError(operation string, err error)
+}
+
+type ErrorObserverFunc func(string, error)
+
+func (f ErrorObserverFunc) ObserveError(operation string, err error) { f(operation, err) }
+
+type NoopErrorObserver struct{}
+
+func (NoopErrorObserver) ObserveError(string, error) {}

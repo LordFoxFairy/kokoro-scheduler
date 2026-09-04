@@ -22,7 +22,8 @@ import (
 
 const (
 	OccurrenceHeader           = "X-Kokoro-Scheduler-Occurrence"
-	JobHeader                  = "X-Kokoro-Scheduler-Job"
+	ScheduleHeader             = "X-Kokoro-Scheduler-Schedule"
+	TenantHeader               = "X-Kokoro-Tenant-Id"
 	RequestIDHeader            = "X-Request-Id"
 	IdempotencyHeader          = "Idempotency-Key"
 	MaxResponseBodyBytes int64 = 1 << 20
@@ -93,42 +94,47 @@ func NewDefaultClientWithAllowlist(timeout time.Duration, targetServiceToken str
 	return NewClientWithResolver(&http.Client{Transport: transport, Timeout: timeout}, targetServiceToken, net.DefaultResolver, allowlist)
 }
 
-func (c *Client) Dispatch(ctx context.Context, job domain.Job, occurrence domain.Occurrence) domain.RunResult {
-	requestID, idempotencyKey := domain.RequestIdentity(job, occurrence.ScheduledAt)
-	traceID := domain.TraceIdentity(job, occurrence.ScheduledAt)
+func (c *Client) Dispatch(ctx context.Context, work domain.DispatchWork) domain.DispatchResult {
+	identity := domain.OccurrenceIdentity(work.ScheduleSnapshot(), work.ScheduledAt)
+	result := domain.DispatchResult{
+		RequestID:      identity.RequestID,
+		IdempotencyKey: identity.IdempotencyKey,
+		TraceID:        identity.TraceID,
+	}
 	requestCtx := ctx
 	cancel := func() {}
 	if c.httpClient.Timeout > 0 {
 		requestCtx, cancel = context.WithTimeout(ctx, c.httpClient.Timeout)
 	}
 	defer cancel()
-	body := job.Body
+	body := work.Payload
 	if len(body) == 0 {
 		body = []byte(`{}`)
 	}
 	if !json.Valid(body) {
-		return domain.RunResult{Err: errors.New("job body is invalid JSON"), Code: "SCHEDULER_TARGET_UNAVAILABLE", RequestID: requestID, IdempotencyKey: idempotencyKey, TraceID: traceID}
+		result.Err = errors.New("dispatch payload is invalid JSON")
+		result.Code = domain.CodeTargetRejected
+		return result
 	}
-	parsedURL, targetAddress, err := c.resolveTarget(requestCtx, job.URL)
+	parsedURL, targetAddress, err := c.resolveTarget(requestCtx, work.TargetURL)
 	if err != nil {
-		code := "SCHEDULER_TARGET_REJECTED"
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
-			code = "SCHEDULER_TARGET_TIMEOUT"
-		} else if !errors.Is(err, errTargetRejected) {
-			code = "SCHEDULER_TARGET_UNAVAILABLE"
-		}
-		return domain.RunResult{Err: err, Code: code, RequestID: requestID, IdempotencyKey: idempotencyKey, TraceID: traceID}
+		result.Code = classifyTransportError(requestCtx, err)
+		result.Err = err
+		return result
 	}
-	request, err := http.NewRequestWithContext(requestCtx, string(job.Method), job.URL, bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(requestCtx, string(work.Method), work.TargetURL, bytes.NewReader(body))
 	if err != nil {
-		return domain.RunResult{Err: err, Code: "SCHEDULER_TARGET_UNAVAILABLE", RequestID: requestID, IdempotencyKey: idempotencyKey, TraceID: traceID}
+		result.Err = err
+		result.Code = domain.CodeTargetRejected
+		return result
 	}
 	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set(JobHeader, job.Name)
-	request.Header.Set(OccurrenceHeader, occurrence.Identity())
-	request.Header.Set(RequestIDHeader, requestID)
-	request.Header.Set(IdempotencyHeader, idempotencyKey)
-	request.Header.Set("traceparent", traceparent(traceID, requestID))
+	request.Header.Set(TenantHeader, work.TenantID)
+	request.Header.Set(ScheduleHeader, work.ScheduleName)
+	request.Header.Set(OccurrenceHeader, identity.ScheduledAt.Format(time.RFC3339Nano))
+	request.Header.Set(RequestIDHeader, identity.RequestID)
+	request.Header.Set(IdempotencyHeader, identity.IdempotencyKey)
+	request.Header.Set("traceparent", traceparent(identity.TraceID, identity.RequestID))
 	if c.targetServiceToken != "" {
 		request.Header.Set("Authorization", "Bearer "+c.targetServiceToken)
 	}
@@ -140,35 +146,58 @@ func (c *Client) Dispatch(ctx context.Context, job domain.Job, occurrence domain
 	}
 	response, err := c.doResolved(request, parsedURL.Hostname())
 	if err != nil {
-		code := "SCHEDULER_TARGET_UNAVAILABLE"
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
-			code = "SCHEDULER_TARGET_TIMEOUT"
-		}
-		return domain.RunResult{Err: err, Code: code, RequestID: requestID, IdempotencyKey: idempotencyKey, TraceID: traceID}
+		result.Code = classifyTransportError(requestCtx, err)
+		result.Err = sanitizeTransportError(err)
+		return result
 	}
 	defer response.Body.Close()
-	result := domain.RunResult{Status: response.StatusCode, RequestID: requestID, IdempotencyKey: idempotencyKey, TraceID: traceID}
+	result.Status = response.StatusCode
 	if response.ContentLength > MaxResponseBodyBytes {
-		result.Code = "SCHEDULER_TARGET_REJECTED"
+		result.Code = domain.CodeTargetRejected
 		result.Err = fmt.Errorf("target response body exceeds %d bytes", MaxResponseBodyBytes)
 		return result
 	}
 	bytesRead, readErr := io.Copy(io.Discard, io.LimitReader(response.Body, MaxResponseBodyBytes+1))
 	if readErr != nil {
-		result.Code = "SCHEDULER_TARGET_UNAVAILABLE"
+		result.Code = domain.CodeTargetUnavailable
 		result.Err = readErr
 		return result
 	}
 	if bytesRead > MaxResponseBodyBytes {
-		result.Code = "SCHEDULER_TARGET_REJECTED"
+		result.Code = domain.CodeTargetRejected
 		result.Err = fmt.Errorf("target response body exceeds %d bytes", MaxResponseBodyBytes)
 		return result
 	}
 	if !result.Succeeded() {
-		result.Code = "SCHEDULER_TARGET_REJECTED"
-		result.Err = fmt.Errorf("job returned HTTP %d", response.StatusCode)
+		if response.StatusCode == http.StatusRequestTimeout || response.StatusCode == http.StatusTooEarly || response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= http.StatusInternalServerError {
+			result.Code = domain.CodeTargetUnavailable
+		} else {
+			result.Code = domain.CodeTargetPermanent
+		}
+		result.Err = fmt.Errorf("target returned HTTP %d", response.StatusCode)
 	}
 	return result
+}
+
+func classifyTransportError(ctx context.Context, err error) string {
+	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
+		return domain.CodeCancelled
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+		return domain.CodeTargetTimeout
+	}
+	if errors.Is(err, errTargetRejected) {
+		return domain.CodeTargetRejected
+	}
+	return domain.CodeTargetUnavailable
+}
+
+func sanitizeTransportError(err error) error {
+	var requestError *url.Error
+	if errors.As(err, &requestError) && requestError.Err != nil {
+		return fmt.Errorf("dispatch target request: %w", requestError.Err)
+	}
+	return err
 }
 
 func (c *Client) resolveTarget(ctx context.Context, rawURL string) (*url.URL, netip.Addr, error) {

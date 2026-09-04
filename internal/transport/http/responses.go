@@ -5,19 +5,26 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/LordFoxFairy/kokoro-scheduler/internal/domain"
 )
 
-type jobResponse struct {
+type scheduleResponse struct {
+	ID            string          `json:"id"`
 	Name          string          `json:"name"`
 	Schedule      string          `json:"schedule"`
+	Timezone      string          `json:"timezone"`
 	URL           string          `json:"url"`
 	Method        string          `json:"method"`
 	Body          json.RawMessage `json:"body"`
 	Retry         retryResponse   `json:"retry"`
 	MisfirePolicy string          `json:"misfire_policy"`
+	CatchUpLimit  int             `json:"catch_up_limit"`
+	OverlapPolicy string          `json:"overlap_policy"`
 	Paused        bool            `json:"paused"`
+	NextDueAt     string          `json:"next_due_at"`
+	Version       int64           `json:"version"`
 }
 
 type retryResponse struct {
@@ -27,17 +34,21 @@ type retryResponse struct {
 	MaxRetryWindowSeconds int `json:"max_retry_window_seconds"`
 }
 
-func toJobResponse(job domain.Job) jobResponse {
-	return jobResponse{
-		Name: job.Name, Schedule: job.Schedule, URL: job.URL, Method: string(job.Method),
-		Body: append(json.RawMessage(nil), job.Body...),
+func toScheduleResponse(schedule domain.Schedule) scheduleResponse {
+	nextDueAt := ""
+	if !schedule.NextDueAt.IsZero() {
+		nextDueAt = domain.NormalizeInstant(schedule.NextDueAt).Format(time.RFC3339Nano)
+	}
+	return scheduleResponse{
+		ID: schedule.ID, Name: schedule.Name, Schedule: schedule.Rule, Timezone: schedule.Timezone,
+		URL: schedule.TargetURL, Method: string(schedule.Method), Body: append(json.RawMessage(nil), schedule.Payload...),
 		Retry: retryResponse{
-			MaxAttempts:           job.Retry.MaxAttempts,
-			BackoffSeconds:        job.Retry.BackoffSeconds,
-			MaxBackoffSeconds:     job.Retry.MaxBackoffSeconds,
-			MaxRetryWindowSeconds: job.Retry.MaxRetryWindowSeconds,
+			MaxAttempts: schedule.Retry.MaxAttempts, BackoffSeconds: schedule.Retry.BackoffSeconds,
+			MaxBackoffSeconds: schedule.Retry.MaxBackoffSeconds, MaxRetryWindowSeconds: schedule.Retry.MaxRetryWindowSeconds,
 		},
-		MisfirePolicy: string(job.MisfirePolicy), Paused: job.Paused,
+		MisfirePolicy: string(schedule.MisfirePolicy), CatchUpLimit: schedule.CatchUpLimit,
+		OverlapPolicy: string(schedule.OverlapPolicy), Paused: schedule.Status == domain.SchedulePaused,
+		NextDueAt: nextDueAt, Version: schedule.Version,
 	}
 }
 
@@ -46,16 +57,21 @@ func fingerprint(scope string, payload []byte) string {
 	return fmt.Sprintf("sha256:%x", digest[:])
 }
 
-func responseRequestID(body []byte, defaultRequestID string) string {
-	var envelope struct {
-		Meta struct {
-			RequestID string `json:"request_id"`
-		} `json:"meta"`
+func receiptResponse(receipt domain.CommandReceipt) (int, map[string]any) {
+	switch receipt.Result.Code {
+	case domain.ResultAlreadyExists:
+		return http.StatusConflict, errorResponse("schedule_already_exists", "scheduler schedule already exists", receipt.RequestID)
+	case domain.ResultNotFound:
+		return http.StatusNotFound, errorResponse("schedule_not_found", "scheduler schedule was not found", receipt.RequestID)
+	case domain.ResultRegistered, domain.ResultUpdated, domain.ResultPaused, domain.ResultResumed, domain.ResultDeleted:
+		data := map[string]any{"name": receipt.Result.Name, "status": receipt.Result.Code}
+		if receipt.Result.Schedule != nil {
+			data["schedule"] = toScheduleResponse(*receipt.Result.Schedule)
+		}
+		return http.StatusOK, map[string]any{"data": data, "meta": map[string]string{"request_id": receipt.RequestID}}
+	default:
+		return http.StatusInternalServerError, errorResponse("scheduler_response_invalid", "scheduler command result is invalid", receipt.RequestID)
 	}
-	if err := json.Unmarshal(body, &envelope); err == nil && envelope.Meta.RequestID != "" {
-		return envelope.Meta.RequestID
-	}
-	return defaultRequestID
 }
 
 func errorResponse(code, message, requestID string) map[string]any {

@@ -30,35 +30,6 @@ func (c *Clock) Advance(duration time.Duration) {
 	c.mu.Unlock()
 }
 
-type Sleeper struct {
-	mu        sync.Mutex
-	Clock     *Clock
-	Durations []time.Duration
-	Err       error
-}
-
-func (s *Sleeper) Wait(ctx context.Context, duration time.Duration) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.Err != nil {
-		return s.Err
-	}
-	s.Durations = append(s.Durations, duration)
-	if s.Clock != nil {
-		s.Clock.Advance(duration)
-	}
-	return nil
-}
-
-func (s *Sleeper) Waits() []time.Duration {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]time.Duration(nil), s.Durations...)
-}
-
 type RandomSource struct {
 	mu     sync.Mutex
 	Values []int64
@@ -87,113 +58,98 @@ func (s *RandomSource) Int63n(maxExclusive int64) (int64, error) {
 	return value, nil
 }
 
-func (s *RandomSource) UpperBounds() []int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]int64(nil), s.Limits...)
-}
-
-type ScheduleEngine struct {
-	mu      sync.Mutex
-	next    int
-	entries map[int]func()
-	started bool
-	stopped bool
-}
-
-func NewScheduleEngine() *ScheduleEngine { return &ScheduleEngine{entries: make(map[int]func())} }
-
-func (e *ScheduleEngine) Add(_ string, run func()) (ports.EntryID, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.next++
-	e.entries[e.next] = run
-	return ports.EntryID(e.next), nil
-}
-func (e *ScheduleEngine) Remove(id ports.EntryID) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	delete(e.entries, int(id))
-}
-func (e *ScheduleEngine) Start() { e.mu.Lock(); e.started = true; e.mu.Unlock() }
-func (e *ScheduleEngine) Stop(context.Context) error {
-	e.mu.Lock()
-	e.stopped = true
-	e.mu.Unlock()
-	return nil
-}
-func (e *ScheduleEngine) Trigger(id int) {
-	e.mu.Lock()
-	run := e.entries[id]
-	e.mu.Unlock()
-	if run != nil {
-		run()
-	}
-}
-
-// TargetClient is a deterministic test double and never ships in production.
 type TargetClient struct {
 	mu      sync.Mutex
-	Calls   int
-	Results []domain.RunResult
+	Calls   []domain.DispatchWork
+	Results []domain.DispatchResult
 	Block   <-chan struct{}
 }
 
-func (c *TargetClient) Dispatch(ctx context.Context, _ domain.Job, _ domain.Occurrence) domain.RunResult {
+func (c *TargetClient) Dispatch(ctx context.Context, work domain.DispatchWork) domain.DispatchResult {
 	c.mu.Lock()
-	c.Calls++
+	c.Calls = append(c.Calls, work)
 	c.mu.Unlock()
 	if c.Block != nil {
 		select {
 		case <-c.Block:
 		case <-ctx.Done():
-			return domain.RunResult{Err: ctx.Err(), Code: "SCHEDULER_TARGET_TIMEOUT"}
+			return domain.DispatchResult{Err: ctx.Err(), Code: domain.CodeTargetTimeout}
 		}
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.Results) == 0 {
-		return domain.RunResult{Status: 202}
+		return domain.DispatchResult{Status: 202}
 	}
 	result := c.Results[0]
 	c.Results = c.Results[1:]
 	return result
 }
 
-func (c *TargetClient) CallCount() int { c.mu.Lock(); defer c.mu.Unlock(); return c.Calls }
-
-type LeaseStore struct {
-	mu           sync.Mutex
-	claims       map[string]bool
-	AcquireCalls int
-	RenewCalls   int
+func (c *TargetClient) CallCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.Calls)
 }
 
-func NewLeaseStore() *LeaseStore { return &LeaseStore{claims: make(map[string]bool)} }
+type Wakeup struct {
+	mu      sync.Mutex
+	run     func(context.Context)
+	Started bool
+	Stopped bool
+}
+
+func (w *Wakeup) Start(run func(context.Context)) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.run = run
+	w.Started = true
+	return nil
+}
+
+func (w *Wakeup) Stop(context.Context) error {
+	w.mu.Lock()
+	w.Stopped = true
+	w.mu.Unlock()
+	return nil
+}
+
+func (w *Wakeup) Trigger() {
+	w.mu.Lock()
+	run := w.run
+	w.mu.Unlock()
+	if run != nil {
+		run(context.Background())
+	}
+}
+
+type LeaseStore struct {
+	mu     sync.Mutex
+	claims map[string]struct{}
+}
+
+func NewLeaseStore() *LeaseStore { return &LeaseStore{claims: make(map[string]struct{})} }
 
 func (s *LeaseStore) Acquire(_ context.Context, key string, _ time.Duration) (ports.Lease, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.AcquireCalls++
-	if s.claims[key] {
+	if _, exists := s.claims[key]; exists {
 		return nil, false, nil
 	}
-	s.claims[key] = true
-	return &lease{store: s}, true, nil
+	s.claims[key] = struct{}{}
+	return &lease{store: s, key: key}, true, nil
 }
 
-type lease struct{ store *LeaseStore }
+type lease struct {
+	store *LeaseStore
+	key   string
+}
 
-func (l *lease) Renew(context.Context, time.Duration) error {
+func (*lease) Renew(context.Context, time.Duration) error { return nil }
+
+func (l *lease) Release(context.Context) error {
 	l.store.mu.Lock()
-	l.store.RenewCalls++
+	delete(l.store.claims, l.key)
 	l.store.mu.Unlock()
 	return nil
-}
-func (l *lease) Release(context.Context) error { return nil }
-
-func (s *LeaseStore) RenewalCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.RenewCalls
 }

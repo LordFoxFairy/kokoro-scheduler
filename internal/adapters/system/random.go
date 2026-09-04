@@ -1,28 +1,10 @@
 package system
 
 import (
-	"context"
 	"crypto/rand"
 	"errors"
 	"math/big"
-	"time"
 )
-
-type Sleeper struct{}
-
-func (Sleeper) Wait(ctx context.Context, duration time.Duration) error {
-	if duration <= 0 {
-		return nil
-	}
-	timer := time.NewTimer(duration)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
 
 type CryptoRandomSource struct{}
 

@@ -1,10 +1,7 @@
 package system
 
 import (
-	"context"
-	"errors"
 	"testing"
-	"time"
 )
 
 func TestCryptoRandomSourceReturnsValueInsideRequestedRange(t *testing.T) {
@@ -23,18 +20,5 @@ func TestCryptoRandomSourceReturnsValueInsideRequestedRange(t *testing.T) {
 func TestCryptoRandomSourceRejectsNonPositiveUpperBound(t *testing.T) {
 	if _, err := (CryptoRandomSource{}).Int63n(0); err == nil {
 		t.Fatal("non-positive upper bound must fail")
-	}
-}
-
-func TestSleeperHonorsContextCancellation(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	started := time.Now()
-	err := (Sleeper{}).Wait(ctx, time.Hour)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("error = %v, want context cancellation", err)
-	}
-	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Fatalf("cancelled wait took %s", elapsed)
 	}
 }

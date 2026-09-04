@@ -18,6 +18,9 @@ func TestStoreClaimsAndRenewsOnlyItsOwnLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if options.DB != 7 {
+		t.Fatalf("Scheduler Redis integration must use logical DB 7, got %d", options.DB)
+	}
 	client := redis.NewClient(options)
 	defer client.Close()
 	store := NewStore(client, time.Second)
@@ -36,7 +39,11 @@ func TestStoreClaimsAndRenewsOnlyItsOwnLease(t *testing.T) {
 	if err := lease.Release(context.Background()); err != nil {
 		t.Fatalf("release: %v", err)
 	}
-	if _, acquired, err := store.Acquire(context.Background(), key, time.Minute); err != nil || !acquired {
+	replacement, acquired, err := store.Acquire(context.Background(), key, time.Minute)
+	if err != nil || !acquired {
 		t.Fatalf("acquire after release acquired=%v err=%v", acquired, err)
+	}
+	if err := replacement.Release(context.Background()); err != nil {
+		t.Fatalf("release replacement lease: %v", err)
 	}
 }
