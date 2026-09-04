@@ -18,6 +18,19 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: kokoro
+          POSTGRES_PASSWORD: kokoro
+          POSTGRES_DB: kokoro_scheduler_test_release
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U kokoro -d kokoro_scheduler_test_release"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
       redis:
         image: redis:7.4
         ports:
@@ -28,7 +41,9 @@ jobs:
           --health-timeout 3s
           --health-retries 5
     env:
-      SCHEDULER_REDIS_TEST_URL: redis://127.0.0.1:6379/15
+      SCHEDULER_DATABASE_URL: postgresql://kokoro:kokoro@127.0.0.1:5432/kokoro_scheduler_test_release
+      SCHEDULER_DATABASE_TEST_URL: postgresql://kokoro:kokoro@127.0.0.1:5432/kokoro_scheduler_test_release
+      SCHEDULER_REDIS_TEST_URL: redis://127.0.0.1:6379/7
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -48,19 +63,30 @@ jobs:
           cache: true
       - name: Check formatting
         run: test -z "$(gofmt -l .)"
+      - name: Verify tidy module graph
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+          go mod verify
+      - name: Apply canonical schema to fresh release-test database
+        run: ./scripts/db-apply-schema
+      - name: Run contract gate
+        run: ./scripts/contract-check
       - name: Run tests
-        run: go test ./...
+        run: go test -count=1 ./...
       - name: Run race-enabled tests
-        run: go test -race ./...
+        run: go test -race -count=1 ./...
       - name: Run vet
         run: go vet ./...
-      - name: Build production binary
-        run: go build -trimpath -ldflags='-s -w' -o /tmp/kokoro-scheduler ./cmd/scheduler
+      - name: Build production commands
+        run: go build ./...
       - name: Build and smoke production image
         run: |
           docker build --tag kokoro-scheduler:release-candidate .
           container="$(docker run --detach --network host \
-            --env SCHEDULER_REDIS_URL=redis://127.0.0.1:6379/15 \
+            --env SCHEDULER_DATABASE_URL="$SCHEDULER_DATABASE_URL" \
+            --env SCHEDULER_REDIS_URL=redis://127.0.0.1:6379/7 \
+            --env SCHEDULER_INTERNAL_SERVICE_TOKEN=release-smoke-token \
             kokoro-scheduler:release-candidate)"
           trap 'docker rm --force "$container" >/dev/null 2>&1 || true' EXIT
           for attempt in $(seq 1 30); do

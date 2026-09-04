@@ -1,10 +1,10 @@
 # adapters 架构地图
 
-本目录只包含 ports 的技术实现：
+- `postgres/`：`Store`/`TxStore`、tenant-scoped SQL、`FOR UPDATE SKIP LOCKED` claim、outbox/recovery、空库 schema bootstrap；
+- `recurrence/`：五字段 cron、descriptor、`@every`、IANA timezone、DST/DOM-DOW语义；
+- `gocron/`：固定周期进程内 wakeup，不加载或保存 Schedule；
+- `httpclient/`：POST/PUT dispatch、稳定 identity、timeout/cancellation、DNS pin、错误分类；
+- `redis/`：可选 DB 7 token-fenced coordination lease；
+- `system/`：操作系统加密随机源，用于 full jitter。
 
-- `cron/`：robfig/cron 定时器；
-- `httpclient/`：通用 JSON command dispatch；
-- `redis/`：带 token 校验的 occurrence lease acquire/renew/release。
-- `system/`：context-aware retry timer 与操作系统加密随机源。
-
-禁止在 adapter 中添加 Billing、Agent 或其他业务事实。
+Adapter 实现技术 port，不拥有 misfire/overlap状态机、tenant授权或其他 Kokoro业务事实。

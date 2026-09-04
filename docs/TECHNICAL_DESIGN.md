@@ -1,202 +1,107 @@
 # kokoro-scheduler 技术设计
 
-## 1. 定位与 owner
+## 1. Owner 与原则
 
-`kokoro-scheduler` 是 Kokoro 的通用内部定时调度服务，唯一生产入口为 `cmd/scheduler/main.go`。它只拥有：
+`kokoro-scheduler` 拥有通用 Schedule、Occurrence、command receipt、dispatch outbox、retry 与 claim。它不拥有 BFF `ScheduledTask`、IAM 权限事实或目标 command 的业务结果。
 
-1. **Schedule**：配置校验、进程内 job registry、UTC cron 注册、pause/resume；
-2. **Occurrence**：计划/观察时间、稳定 identity 和 misfire 判断；
-3. **Lease**：可选 Redis 跨实例 occurrence claim、renew 和 token-safe release；
-4. **Retry**：可重试分类、attempt 上限、指数 ceiling、full jitter、总窗口；
-5. **Dispatch**：向目标 owner 的 internal HTTP command 发送 opaque JSON，并归一技术结果。
-
-Scheduler 不拥有 `ScheduledTask`、用户/tenant 授权、Billing/Payment/Credit/Agent 等业务模型、目标 command
-状态、业务幂等 receipt 或业务事件。本仓没有业务数据库，也不读取任何其他 owner 的数据库。
-
-## 2. 分层与依赖方向
+架构锁定为：
 
 ```text
-kokoro-scheduler/
-├── cmd/scheduler/                 # 唯一组合根、signals、HTTP server
-├── internal/
-│   ├── domain/                    # Job、RetryPolicy、Occurrence、RunResult、不变量
-│   ├── application/               # registry、misfire、lease、retry、dispatch、lifecycle
-│   ├── ports/                     # Clock、Sleeper、RandomSource、Engine、Lease、Target、Observer
-│   ├── adapters/
-│   │   ├── cron/                  # robfig/cron/v3
-│   │   ├── httpclient/            # outbound net/http
-│   │   ├── redis/                 # go-redis token lease
-│   │   └── system/                # context timer、crypto random
-│   ├── transport/http/            # probes 与 internal job command
-│   └── config/                    # environment loading
-├── test/doubles/                  # 仅测试替身
-├── contract/openapi/v1/           # Scheduler 自有机器 HTTP contract
-└── docs/                          # 当前设计、运维与治理入口
+trusted caller -> HTTP transport -> Application command transaction -> PostgreSQL
+                                                            |
+gocron/v2 fixed wakeup -> Application cycle -> due planner -> occurrence + outbox
+                                            -> dispatcher -> target HTTP
+                                                   |
+                                            optional Redis DB 7 lease
 ```
+
+PostgreSQL 是可恢复事实源。gocron/v2 是可替换 `Wakeup` adapter，不读取 schedule rule，也不保存任何执行历史。Redis 删除或不可用不会删除事实；配置 Redis 时协调失败会 defer durable outbox，而不是绕过 lease。
+
+## 2. 分层与 ports
 
 ```text
-transport -> application -> domain
-                    \----> ports <---- adapters
-cmd/scheduler -> transport + application + concrete adapters
+cmd/scheduler/                 composition root
+internal/domain/               pure model/state/policy
+internal/application/          transaction use cases and recovery
+internal/ports/                Store/TxStore, Clock, Recurrence, Wakeup, Lease, Target
+internal/adapters/postgres/    durable store and claims
+internal/adapters/recurrence/  recurrence calculation
+internal/adapters/gocron/      process wakeup only
+internal/adapters/redis/       optional coordination lease
+internal/adapters/httpclient/  outbound dispatch
+internal/transport/http/       inbound control boundary
 ```
 
-- Domain 不依赖 `net/http`、Redis、数据库或其他 Kokoro 业务包。
-- Application 只通过 ports 使用 timer、clock、random、lease 和 target client。
-- Adapters 实现技术细节，不决定业务授权或目标 command 语义。
-- Transport 负责 strict JSON、service auth、request metadata、response/error mapping。
-- `cmd/scheduler` 负责 concrete wiring，不承载 Schedule/Retry 规则。
+依赖固定为 `transport -> application -> domain`、`application -> ports`、`adapters -> ports/domain`。Domain 仅依赖 Go 标准库；Application 不 import concrete adapter。
 
-架构测试检查目录、旧根实现删除、关键依赖禁入和 OpenAPI 路由存在性。
+## 3. Command 事务与 tenant
 
-## 3. 核心模型与状态
+Transport 从受信 `X-Kokoro-Tenant-Id` 取得 tenant，验证 service Bearer、request ID、idempotency key、path 和严格 JSON。Application 再验证 tenant、command identity、Schedule 及 recurrence。
 
-`Job` 由 `name`、`schedule`、`url`、`method`、`body`、`retry`、`misfire_policy`、`paused` 构成。
-字段级范围和 Redis record 见 [`DATA_MODEL.md`](./DATA_MODEL.md)。
+每个 mutation 在一个 PostgreSQL transaction 内执行：
 
-Job registry 的运行状态：
+1. 对 `(tenant, scope, idempotency key)` 获取 transaction advisory lock；
+2. 查 durable receipt；同 request digest 返回原 receipt，不同 digest 返回 conflict；
+3. create/replace/delete/pause/resume tenant-scoped Schedule；
+4. 写 receipt 后提交。
 
-```text
-configured -> active <-> paused -> removed
-```
+因此请求在进程重启后仍可精确 replay。POST 已存在和目标不存在也是可 replay 的持久化 command result。PUT 是完整替换，不保留旧字段兼容路径。
 
-Occurrence 是瞬时用例，不是 durable state machine：
+## 4. Due planning 与原子 outbox
 
-```text
-observed -> validate -> misfire/pause/stale check -> optional lease
-         -> target attempt -> success
-                           \-> retry wait -> target attempt
-                           \-> terminal failure/cancel
-```
+每个 wakeup cycle 先运行 planner，再运行 dispatcher。启动时 Application 立即触发一次 cycle，不等待第一个 timer tick。
 
-所有具体时间进入领域层后统一 `.UTC()`。标准 cron 由 `robfig/cron/v3` 在 UTC location 计算；
-`@every` 使用库提供的 duration schedule。一个 cron entry 使用 `SkipIfStillRunning` 防止单实例同一 entry 重叠。
+Planner：
 
-## 4. 启动与装配流程
+1. 在短事务中按 `(next_due_at, id)` 选择 active due Schedule；
+2. 使用 `FOR UPDATE SKIP LOCKED` 写 worker/expiry claim；
+3. 按 Schedule 的 recurrence 与 misfire policy 生成 plan；
+4. 在单一事务中检查 open occurrence、插入 Occurrence、插入 dispatch outbox、推进 `next_due_at` 并释放 claim。
 
-```text
-config.Load
-  -> strict LoadJobs(SCHEDULER_JOBS_JSON)
-  -> optional Redis URL parse + 5s PING
-  -> create cron/http/redis/system adapters
-  -> application.NewScheduler
-  -> register every configured job (all-or-exit)
-  -> start HTTP listener
-  -> scheduler.Start / ready=true
-  -> wait for signal or listener error
-```
+`UNIQUE (tenant_id, schedule_id, scheduled_at)` 和 `UNIQUE (tenant_id, occurrence_id)` 是重复防线。若并发 update/delete 使 Schedule version/claim 失效，整个 materialization transaction 回滚。
 
-- 未设置、空字符串或纯空白 `SCHEDULER_JOBS_JSON` 等价于 `[]`。
-- 任一配置或 cron entry 注册失败会在 scheduler 启动前终止进程。
-- Redis 配置后即成为 readiness/dispatch 协调依赖；启动不可达时进程退出。
-- HTTP listener 和 cron 共用一个进程，但 probes 与 command API 语义分离。
+## 5. Recurrence、timezone 与 DST
 
-## 5. Registry mutation 流程
+Schedule 持久化原始本地 rule 与独立 IANA timezone；API 和 occurrence 只传 RFC3339 UTC instant。
 
-受信服务通过以下 `internal-owner` surface 操作通用 job：
+支持：
 
-```text
-POST   /internal/scheduler/v1/jobs/{name}
-PUT    /internal/scheduler/v1/jobs/{name}
-DELETE /internal/scheduler/v1/jobs/{name}
-POST   /internal/scheduler/v1/jobs/{name}/pause
-POST   /internal/scheduler/v1/jobs/{name}/resume
-```
+- 五字段 `minute hour day-of-month month day-of-week`；
+- `*`、`,`、闭区间 `-`、step `/`；`N/step` 从 N 延续到字段最大值；
+- `JAN`–`DEC`、`SUN`–`SAT`，Sunday 0/7；
+- `@yearly`/`@annually`/`@monthly`/`@weekly`/`@daily`/`@midnight`/`@hourly`；
+- `@every DURATION`，1 秒至 366 天、毫秒精度。
 
-处理顺序：service token -> request ID -> route/method -> idempotency key -> body size/strict JSON -> domain
-normalize/validate -> application mutation -> stable envelope -> 进程内 receipt。相同 method/path/key 与 canonical
-payload replay 原 status/body；冲突 payload 返回 409。
+DOM/DOW：两者都受限时 OR；一方为 `*` 或等价 `*/1` 时由另一方筛选。保存前检查字段范围和 selected month 中是否存在可用日期。cron 以 UTC minute 递增并映射到 IANA location 判断，因此 DST gap 自然不产生 instant，DST fold 会产生两个不同 UTC instant。搜索 horizon 为 10 年。
 
-Registry 与 receipt 都只存在当前进程。BFF 拥有业务 `ScheduledTask`，部署或 BFF 必须在 Scheduler 重启后重放
-仍有效的通用注册。Scheduler 不为此创建 PostgreSQL 表或复制 BFF DTO。
+`@every` 不按 wall clock 对齐；以已持久化 due instant 为 anchor，downtime 后用整数倍推进。
 
-## 6. Occurrence dispatch 流程
+## 6. Misfire 与 overlap
 
-1. cron closure 读取 UTC now，并以它作为当前 `scheduled_at` / `observed_at` 调用 application；恢复器也可显式
-   提供两个时间。
-2. Job 再次 normalize/validate；构造稳定 request、idempotency 和 trace identity。
-3. `misfire_policy=skip`、paused、stale trigger 在调用目标前结束。
-4. 配置 Redis 时，以 job + occurrence key 获取 26 小时 token lease；获取错误 fail closed，未获取表示另一实例
-   已 claim。
-5. lease 存续期间每 `TTL / 3` renew；lost lease 取消 run context。
-6. TargetClient 发送 JSON `POST`/`PUT`，可选附加独立 target service token。
-7. 2xx 成功；429、5xx、网络错误在 attempt 与 window 双预算内 full-jitter retry；其他 4xx 终止。
-8. 成功 claim 留到 TTL 到期；失败/cancelled claim 尝试 token-safe release。
-9. Observer 写归一后的 result；不读取或持久化目标业务 body。
+- `skip`：记录一个 `skipped/SCHEDULER_MISFIRE_SKIPPED` occurrence，然后推进至 now 之后；
+- `fire_once`：为最早 due instant 建立一个 dispatch，随后推进至 now 之后；
+- `catch_up_bounded`：按时间顺序最多建立 `catch_up_limit` 个 plan；仍有 backlog 时再写一个 `SCHEDULER_MISFIRE_BOUND_EXCEEDED` skipped occurrence，并推进至 now 之后。
 
-该流程降低重复概率但保持 at-least-once。目标 owner 必须以 occurrence `Idempotency-Key` 保存 durable receipt。
+`overlap_policy=forbid` 会查询同 tenant/schedule 的 pending/dispatching/retrying occurrence。已有 open occurrence 时，新 plan 变为 `skipped/SCHEDULER_OVERLAP_BLOCKED`。这是 durable、可查询 SQL 的 outcome，不依赖 timer 的进程内 still-running 行为。`allow` 为每个唯一 due instant 建立独立 outbox。
 
-## 7. HTTP 与安全边界
+## 7. Dispatch、retry 与 recovery
 
-### Inbound
+Dispatcher 在 PostgreSQL transaction 中：
 
-- command surface 使用 `SCHEDULER_INTERNAL_SERVICE_TOKEN` Bearer；未配置时 fail closed；
-- mutation 要求 `X-Request-Id` 和 `Idempotency-Key`；
-- body 上限 1 MiB，严格拒绝未知/重复/null/trailing 字段；
-- `/healthz`、`/readyz` 无认证并只返回最小状态 envelope。
+1. 将 expired final-attempt claim 转为 outbox/occurrence failed；
+2. 用 `FOR UPDATE SKIP LOCKED` claim ready 或 expired outbox；
+3. 如配置 Redis，取得 tenant+occurrence 派生的短期 lease；
+4. 在 transaction 内将 attempt 加一并标记 occurrence dispatching；
+5. 使用 cancellable context 和 overall timeout 调 target；
+6. 在 transaction 内持久化 success、retry 或 permanent failure。
 
-### Outbound
+可重试：HTTP 408/425/429/5xx、DNS/连接/读取网络错误、dispatch timeout。永久：其他非 2xx、target policy/invalid payload、caller cancellation。延迟为 capped exponential full jitter，并同时受 `max_attempts`、`max_backoff_seconds` 和 `max_retry_window_seconds` 限制。
 
-- URL 必须是有 host、无 userinfo/fragment、端口在 1–65535 的 HTTP(S)；literal target 和 dispatch 前单次 DNS 解析结果均拒绝 localhost、loopback、未指定、私有、链路本地、组播及特殊/保留 IP；method 只允许 POST/PUT；
-- `SCHEDULER_TARGET_SERVICE_TOKEN` 非空时发送独立 Bearer；
-- 固定发送 job、occurrence、request、idempotency 和 `traceparent`；
-- current client 使用 30 秒 overall timeout 与 context cancellation；HTTP client 禁止自动跟随 redirect，响应体最多读取 1 MiB。DNS 结果会被写入本次请求的连接地址，避免校验后再次解析造成 TOCTOU；默认拒绝 private/loopback 等特殊地址，可由配置注入的精确 `(host, internal CIDR)` allowlist 覆盖，配置存在时只允许列出的 pair。
+投递 identity 由 tenant、schedule id/name 和 UTC scheduled instant 派生；每次重试/崩溃恢复保持相同 request/idempotency/trace identity。语义是 durable at-least-once，不是 exactly-once。
 
-`SCHEDULER_INTERNAL_TARGET_ALLOWLIST` 由 config 严格解析为 exact DNS host 与 canonical private/loopback/IPv6 ULA
-CIDR 的映射；拒绝 wildcard、重复 host/CIDR、public/special-use CIDR 和未列出的解析答案。目标 hostname/CIDR
-allowlist、egress policy、TLS 强制和 secret distribution 仍由部署边界负责。
-完整风险与控制见 [`SECURITY.md`](./SECURITY.md)。
+## 8. Lifecycle
 
-## 8. 配置 contract
-
-| 环境变量 | 必需性 | 当前语义 |
-|---|---|---|
-| `SCHEDULER_JOBS_JSON` | 可选 | 严格 JSON array；空值为 `[]` |
-| `SCHEDULER_REDIS_URL` | 多实例协调时必需 | occurrence lease；本地共享 Redis 使用 logical DB 7 |
-| `SCHEDULER_HTTP_ADDR` | 可选 | bind address，默认 `:8080` |
-| `SCHEDULER_INTERNAL_SERVICE_TOKEN` | command surface 必需 | 为空时 probes 可用、所有 command 401 |
-| `SCHEDULER_TARGET_SERVICE_TOKEN` | 依目标契约 | 非空时附加到所有 outbound dispatch；与 inbound token 分离 |
-| `SCHEDULER_INTERNAL_TARGET_ALLOWLIST` | 访问内网目标时可选 | 严格 JSON 数组；精确 `host` 映射到 canonical internal `cidrs`；配置存在时仅允许列出的 pair |
-| `SCHEDULER_HEALTHCHECK_URL` | 容器 healthcheck 可选 | healthcheck 子命令使用，默认 `http://127.0.0.1:8080/readyz` |
-
-Retry 范围：`max_attempts=1..10`、`backoff_seconds=1..3600`、
-`max_backoff_seconds=1..3600`、`max_retry_window_seconds=1..86400`，且 max backoff 不小于 base。
-默认值分别为 `1/1/3600/3600`；显式零值不是省略值，会在 strict boundary 失败。
-
-## 9. 存储与一致性
-
-| 数据 | 位置 | 权威性 | 恢复 |
-|---|---|---|---|
-| Job registry | process memory | 当前实例运行配置 | 静态配置 + consumer replay |
-| Inbound idempotency receipt | process memory，最多 10,000 | 当前实例 replay cache | 不跨重启 |
-| Occurrence claim | optional Redis | 26 小时协调窗口 | TTL；失败时 token-safe release |
-| Dispatch result | structured log/callback | 技术观测，不是业务事实 | 日志平台策略 |
-| 业务 command/result | target owner store | 唯一业务事实 | 目标 owner runbook |
-
-本仓没有 PostgreSQL schema。跨实例 lease 不建立业务一致性；目标服务的数据库事务与 receipt 才决定业务结果。
-
-## 10. Shutdown、部署与观测
-
-SIGINT/SIGTERM 或 HTTP listener failure 触发：HTTP shutdown -> `ready=false` -> cancel scheduler context ->
-cron stop -> 等待 in-flight，main 使用 10 秒 shutdown deadline。context-aware retry sleep 和 target request 会响应取消；
-超时后进程记录 shutdown error。
-
-容器以 distroless nonroot 运行，内置 healthcheck 调用同一二进制的 `healthcheck` 子命令。单副本无需 Redis；
-多副本必须共享 Redis 或由部署提供等价 singleton，不能在无协调时假定唯一触发。
-
-当前结构化 dispatch 日志提供 service/operation/request/trace/result/status/attempts/code/duration。稳定指标契约和
-目标见 [`SLO.md`](./SLO.md)；metrics exporter 与告警由部署 owner 尚待实现，不能用目标代替实测证据。
-
-## 11. Contract 与验证
-
-机器 HTTP 事实源：[`../contract/openapi/v1/openapi.yaml`](../contract/openapi/v1/openapi.yaml)。
-版本、生成与 provenance：[`../contract/README.md`](../contract/README.md)。
-
-```bash
-gofmt -w .
-go vet ./...
-go test ./...
-go build ./...
-go test ./internal/architecture ./internal/transport/http
-```
-
-更完整的场景矩阵见 [`ACCEPTANCE.md`](./ACCEPTANCE.md)，故障处置见 [`RUNBOOK.md`](./RUNBOOK.md)。
+- startup：配置校验 -> PostgreSQL connect/ping -> 可选 Redis DB 7 ping -> adapter 装配 -> wakeup start -> immediate cycle -> HTTP serve；
+- readiness：Runtime accepting 且 PostgreSQL ping 成功；配置 Redis 时还要求 Redis ping；
+- shutdown：先关闭 readiness/HTTP，取消 Runtime context，停止 gocron wakeup，并在 10 秒 deadline 内等待 in-flight cycle；
+- crash：PostgreSQL claim expiry 后由其他 cycle 重领；attempt 已耗尽但未提交结果时写 `SCHEDULER_DISPATCH_RECOVERY_EXHAUSTED`。

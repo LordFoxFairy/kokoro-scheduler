@@ -2,30 +2,28 @@
 
 ## 阅读顺序
 
-| 顺序 | 文档 | 说明 |
+| 顺序 | 文档 | 内容 |
 |---:|---|---|
-| 1 | [CURRENT](./CURRENT.md) | 当前实现、明确缺口与证据边界 |
-| 2 | [TECHNICAL_DESIGN](./TECHNICAL_DESIGN.md) | owner、依赖方向、运行流程、状态机与部署模型 |
-| 3 | [API_CONTRACT](./API_CONTRACT.md) | 人类可读的 internal API、dispatch 与 consumer 语义 |
-| 4 | [机器 OpenAPI](../contract/openapi/v1/openapi.yaml) | HTTP 字段、operation 和 response 的唯一 wire source |
-| 5 | [Contract README](../contract/README.md) | owner、visibility、version、generation、breaking、provenance |
-| 6 | [DATA_MODEL](./DATA_MODEL.md) | 内存模型、Redis lease、时间与 retention；明确无业务数据库 |
-| 7 | [SECURITY](./SECURITY.md) | trust boundary、认证、输入、secret 与出站目标控制 |
-| 8 | [RELIABILITY](./RELIABILITY.md) | 交付语义、lease、重试、恢复、退化和风险登记 |
-| 9 | [SLO](./SLO.md) | SLI/SLO、错误预算、指标契约与告警阈值 |
-| 10 | [ACCEPTANCE](./ACCEPTANCE.md) | 可执行命令与行为验收矩阵 |
-| 11 | [RUNBOOK](./RUNBOOK.md) | 启动、诊断、处置、回滚和恢复 |
-| 12 | [ADR index](./ADR/README.md) | 架构决策登记规则与当前索引 |
+| 1 | [CURRENT](./CURRENT.md) | 当前实现、证据边界、缺口和风险 |
+| 2 | [TECHNICAL_DESIGN](./TECHNICAL_DESIGN.md) | owner、依赖、事务、状态机、恢复与 recurrence |
+| 3 | [机器 OpenAPI](../contract/openapi/v1/openapi.yaml) | inbound control 与 outbound dispatch 的唯一 wire source |
+| 4 | [Contract README](../contract/README.md) | lint、parity、breaking signature 与 provenance |
+| 5 | [API_CONTRACT](./API_CONTRACT.md) | 人类可读的调用、幂等、时间与错误策略 |
+| 6 | [DATA_MODEL](./DATA_MODEL.md) | 四张表、约束、索引、关系和 retention |
+| 7 | [RELIABILITY](./RELIABILITY.md) | claim、outbox、retry、restart、degradation |
+| 8 | [SECURITY](./SECURITY.md) | trust boundary、tenant、secret、SQL 和 egress |
+| 9 | [SLO](./SLO.md) | 目标、指标契约与尚未实现的观测项 |
+| 10 | [ACCEPTANCE](./ACCEPTANCE.md) | 可执行验收矩阵 |
+| 11 | [RUNBOOK](./RUNBOOK.md) | schema 安装、启动、诊断、恢复和回滚 |
+| 12 | [ADR index](./ADR/README.md) | 架构决策登记入口 |
 
-仓库级代码地图见 [`../INDEX.md`](../INDEX.md)，五分钟启动见 [`../README.md`](../README.md)。
+仓库代码地图见 [`../INDEX.md`](../INDEX.md)，本地启动见 [`../README.md`](../README.md)。
 
-## 规范入口
+## 唯一事实源
 
-- 技术架构内容只进入 `TECHNICAL_DESIGN.md`；
-- BFF/consumer 接入语义只进入 `API_CONTRACT.md`；
-- 风险、失败恢复与退化只进入 `RELIABILITY.md`；
-- 验收与运行手册分别只使用 `ACCEPTANCE.md`、`RUNBOOK.md`；
-- 不保留小写文件、兼容链接或第二份可编辑 contract。
+- HTTP/dispatch wire contract：`contract/openapi/v1/openapi.yaml`；
+- PostgreSQL current schema：`database/schema.sql`；
+- runtime behavior：当前 commit 的 Go 源码与测试；
+- 当前状态与风险：`docs/CURRENT.md`。
 
-唯一生产入口是 `cmd/scheduler/main.go`；唯一 HTTP wire source 是
-`contract/openapi/v1/openapi.yaml`。
+不保留第二份可编辑 wire schema、历史 migration、旧 timer 实现或进程内事实实现。

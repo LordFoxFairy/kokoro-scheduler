@@ -1,81 +1,51 @@
-# kokoro-scheduler 安全设计
+# kokoro-scheduler 安全边界
 
 ## 1. Trust boundary
 
-```text
-deployment configuration
-        | SCHEDULER_JOBS_JSON / secrets
-        v
-+----------------------+     trusted service caller
-|  kokoro-scheduler    | <--------------------------
-+----------------------+
-        | generic HTTP command + optional target service token
-        v
-target owner internal command endpoint
+Browser 不直接调用 Scheduler。internal caller 通过固定 service Bearer 和受信 `X-Kokoro-Tenant-Id` 调 control API；目标服务通过独立 outbound credential 验证 Scheduler。inbound/outbound token 不复用。
 
-kokoro-scheduler <--- optional private Redis coordination (logical DB 7 locally)
-```
+当前 Bearer 只证明共享 service identity，不提供 caller-specific IAM permission。部署层必须限制网络来源；细粒度授权是明确缺口。
 
-Scheduler 不接收浏览器 session、OAuth user token 或 body 中声明的可信 actor。BFF/目标服务拥有用户认证、
-tenant、permission 和业务授权；Scheduler 只验证进入本仓 command surface 的 service credential。
+## 2. Tenant isolation
 
-## 2. Inbound HTTP controls
+- tenant 不从 body 推导；transport 与 Application 都验证受信 tenant context；
+- command receipt identity、Schedule 查询/写入、Occurrence/outbox 状态变更都带 tenant；
+- uniqueness 包含 tenant；
+- Redis lease key使用 tenant+occurrence digest；
+- target dispatch 明确携带 tenant header。
 
-- `/internal/scheduler/v1/jobs/**` 只接受
-  `Authorization: Bearer <SCHEDULER_INTERNAL_SERVICE_TOKEN>`；token 使用 constant-time compare。
-- token 未配置时进程仍可提供探针，但所有 job command fail closed 为 `401 service_auth_failed`。
-- 每次 mutation 必须有 1–128 字符 `X-Request-Id` 和 1–256 字符 `Idempotency-Key`。
-- job name 只允许 `[a-z0-9][a-z0-9._-]{0,63}`；路径和 method 使用显式 allowlist。
-- request body 最大 1 MiB；JSON parser 拒绝未知/重复字段、`null`、错误类型、trailing value 和错误
-  `Content-Type`。
-- `/healthz`、`/readyz` 无认证，只返回 service/status/request_id；readiness 的 Redis 错误不回传依赖细节。
-- 错误 envelope 不暴露 stack、Redis URL、token 或目标 response body。
+测试覆盖同名 Schedule、相似 idempotency key 的跨 tenant 隔离。任何新增 SQL 必须保持 tenant predicate，architecture/schema/integration gate 不代替代码评审。
 
-OpenAPI 中 command operation 的 `x-kokoro-permission: service-token` 精确表示当前授权机制，不宣称已实现
-IAM fine-grained permission。探针使用 `x-kokoro-permission: none`。
+## 3. Inbound validation
 
-## 3. Outbound dispatch controls
+- constant-time Bearer comparison；
+- name、request ID、idempotency key、tenant 长度/控制字符校验；
+- mutation body 最大 1 MiB，严格 `application/json`；
+- unknown field、duplicate JSON key、null、trailing JSON 拒绝；
+- target URL 不允许 credentials/fragment/非法 port；
+- recurrence/timezone/retry/misfire/overlap 在写 transaction 前验证；
+- error envelope 不返回 SQL、stack、secret 或下游 response body。
 
-- URL validation 只允许有 host 的 `http` / `https`，拒绝 embedded credentials、fragment、异常端口、localhost、loopback、未指定、私有、链路本地、组播和特殊/保留 IP。
-- hostname target 在每次 dispatch 前只解析一次；地址先经过策略，随后将选中的地址固定到本次请求 URL，同时保留原 Host/HTTPS server name，避免 validation 与实际连接之间的 DNS TOCTOU。默认拒绝 private/loopback 等特殊地址；配置 `SCHEDULER_INTERNAL_TARGET_ALLOWLIST` 后，只有精确声明的 `(host, internal CIDR)` pair 才能覆盖该默认拒绝，未列入的地址仍拒绝。
-- HTTP client 禁止自动跟随 redirect；目标 response body 读取上限为 1 MiB。
-- method 只允许 `POST` / `PUT`，body 必须是 JSON object。
-- `SCHEDULER_TARGET_SERVICE_TOKEN` 与 inbound token 分离；非空时只写入 `Authorization` header，不写日志。
-- 每次 dispatch 携带稳定 occurrence idempotency identity、request ID 和 W3C `traceparent`；目标 owner 仍须
-  校验 service identity、tenant scope 和自己的业务 permission。
-- context cancellation 与 30 秒 overall timeout 限制单次请求时长；目标 4xx 不重试，429/5xx/网络错误受
-  attempt 与时间窗口双重约束。
+## 4. PostgreSQL
 
-`SCHEDULER_INTERNAL_TARGET_ALLOWLIST` 是严格 JSON 数组，host 不支持 wildcard，CIDR 必须 canonical 且只能
-落在 RFC1918、loopback 或 IPv6 ULA；配置存在时切换为 allowlist-only 地址策略，便于审计实际可达的内部
-目标。生产部署仍必须通过受审配置、DNS/egress network policy 和目标服务认证把 dispatch 限制在内部 endpoint。
-任何允许修改 ScheduleJob 的 caller 都等价于拥有创建出站请求的能力，必须保持在受信服务边界内。
+`SCHEDULER_DATABASE_URL` 指向 Scheduler 专用 database。Repository 值全部使用 pgx 参数绑定；表/列名是静态源码。Schema 没有跨 owner foreign key，也没有 migration runner。`db:apply-schema` 在 serializable transaction 和 advisory lock 下检查 current namespace 必须为空，避免误把 current schema 当升级目标。
 
-## 4. Secret 与日志
+数据库 credential 由 secret manager 注入，不进入 `.env`、日志、contract 或 commit。生产角色应只拥有 Scheduler database 的连接/DML；schema bootstrap 使用单独受控角色更佳。
 
-| Secret / 敏感数据 | 来源 | 处理规则 |
-|---|---|---|
-| `SCHEDULER_INTERNAL_SERVICE_TOKEN` | 部署 secret | 不提交、不回显、不写日志；轮换时同步 caller 与 Scheduler |
-| `SCHEDULER_TARGET_SERVICE_TOKEN` | 部署 secret | 与 inbound token 独立；轮换时同步 Scheduler 与目标服务 |
-| `SCHEDULER_REDIS_URL` | 部署 secret/config | 可能含 credential，禁止写日志；TLS/ACL 由部署环境配置 |
-| job body | deployment/trusted caller | 作为 opaque JSON 投递；不进入 dispatch 结构化日志 |
+## 5. Outbound egress
 
-结构化日志允许 `service`、`operation`、job name、request_id、trace_id、status、attempts、result、code 和
-duration；不得记录 token、Authorization、Redis URL 或 command body。目标错误当前只记录本仓归一后的
-HTTP status/Go error，不读取或记录目标 response body。
+默认 target policy 拒绝 loopback、private、link-local、multicast、unspecified 等特殊 IP。允许受控 internal target 时，`SCHEDULER_INTERNAL_TARGET_ALLOWLIST` 必须给出精确 hostname 与 canonical CIDR。每次 dispatch 解析一次并 pin 到已校验 IP，同时保留 Host/TLS ServerName，避免校验后重新 DNS 解析。
 
-## 5. Redis coordination security
+redirect 不跟随；proxy 在 pinned request transport 上关闭；只允许 HTTP(S) POST/PUT；response body 最多读取 1 MiB。部署仍需 egress network policy、内部 DNS 控制、目标认证和 allowlist review，应用检查不是网络隔离替代品。
 
-- lease value 是每次 acquire 生成的随机 token；renew/release 都验证 token，避免旧 owner 删除新 lease。
-- Redis 只承载 occurrence claim；泄漏或清空 Redis 可能造成重复 dispatch，但不会直接泄漏业务数据库事实。
-- 多实例必须共享同一受控 Redis/等价 singleton；Redis 不可用或 lease 丢失时 fail closed，不绕过协调继续调用。
-- 本地固定使用 logical DB 7；生产隔离还需网络 ACL、认证和必要时 TLS，logical DB 不是安全边界。
+## 6. Redis
 
-## 6. 当前风险与后续安全门禁
+Redis 可选且 URL 必须显式 `/7`。它只保存随机 token 与 TTL lease，不保存 payload、Schedule、receipt 或执行历史。release 使用 Lua compare/delete，错误时 fail/defer，不跨 logical DB 清理。Redis credential同样只通过 secret 注入。
 
-1. shared bearer token 无 caller-level audit/permission；升级认证机制必须先改 owner contract 和 consumer。
-2. 进程内安全策略不替代部署 egress policy；暴露 command surface 前仍必须验证网络出口和目标服务认证。
-3. registry/receipt 是内存结构；1 MiB request/response body limit 与 10,000 receipt 上限限制资源占用，但高频可信 caller 仍需
-   上游 rate limit 和实例资源限制。
-4. 安全变更必须覆盖负向认证、严格 JSON、header 边界、secret redaction 与目标 mock 测试，并同步
-   `API_CONTRACT.md` 和 OpenAPI。
+## 7. Logs 与敏感数据
+
+禁止记录 Bearer、database/Redis credential、Schedule payload、target response body。当前 dispatch 日志包含 tenant、schedule、attempt、status、稳定 request/trace identity 和 bounded error；部署日志访问应按 internal metadata 保护。metrics label 不使用 tenant、URL、request ID 或 payload，避免高基数和数据泄露。
+
+## 8. Abuse controls 缺口
+
+当前 API 没有 per-caller rate limit、Schedule quota、target-domain owner approval 或 payload字段级敏感信息检测。部署层需要限制 caller 和连接；后续 quota 必须由 Scheduler Application 使用 durable tenant facts实现，不可用进程内 map 作为唯一控制。

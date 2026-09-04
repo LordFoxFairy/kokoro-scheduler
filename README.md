@@ -1,115 +1,137 @@
 # kokoro-scheduler
 
-代码地图：[INDEX.md](INDEX.md)；当前状态：[docs/CURRENT.md](docs/CURRENT.md)；技术设计：
-[docs/TECHNICAL_DESIGN.md](docs/TECHNICAL_DESIGN.md)；文档索引：[docs/INDEX.md](docs/INDEX.md)。
+`kokoro-scheduler` 是通用内部调度 owner。它持久化 Schedule、Occurrence、command receipt、dispatch outbox 与重试结果；不拥有 BFF `ScheduledTask`、Billing、Agent 或目标 command 的业务事实。
 
-通用定时任务子仓库，只负责通用调度配置与 HTTP 触发，不包含 Billing、Payment、Credit 业务逻辑。多实例模式可选连接共享 Redis，仅用于 occurrence claim；本仓 v1 不需要 PostgreSQL，因为任务 registry 只在进程内存中维护，业务执行事实由目标业务仓库写入 PostgreSQL。
+- 代码地图：[INDEX.md](./INDEX.md)
+- 当前实现：[docs/CURRENT.md](./docs/CURRENT.md)
+- 技术设计：[docs/TECHNICAL_DESIGN.md](./docs/TECHNICAL_DESIGN.md)
+- 机器契约：[contract/openapi/v1/openapi.yaml](./contract/openapi/v1/openapi.yaml)
+- 验收：[docs/ACCEPTANCE.md](./docs/ACCEPTANCE.md)
 
-生产代码采用显式 Go 分层，组合根只有 `cmd/scheduler/main.go`：
+## 架构摘要
 
 ```text
-internal/domain/                   Job、Occurrence、RetryPolicy 和不变量
-internal/application/              schedule、lease、retry、dispatch 编排
-internal/ports/                    Clock、ScheduleEngine、LeaseStore、TargetClient
-internal/adapters/cron/            cron 实现
-internal/adapters/httpclient/      HTTP target client
-internal/adapters/redis/            occurrence lease
-internal/adapters/system/           context-aware timer、加密随机源
-internal/transport/http/           internal command API
-internal/config/                   环境配置
+trusted service -> HTTP transport -> application commands -> PostgreSQL
+                                             |
+gocron/v2 wakeup -> planner -> occurrence + dispatch outbox (one transaction)
+                                -> dispatcher -> target HTTP
+                                     |
+                              optional Redis DB 7 lease
 ```
 
-`domain` 不知道 HTTP、Redis 或业务仓；`application` 不直接使用具体 adapter；所有技术实现由
-`cmd/scheduler` 装配。测试替身只位于 `test/doubles/`。
+PostgreSQL 是唯一事实源。`github.com/go-co-op/gocron/v2 v2.22.0` 只按固定间隔唤醒进程内 scanner，不保存 schedule、执行历史或 receipt。Redis 可选且只用于短期协调；删除 Redis 数据不会删除 Scheduler 事实。进程启动后立即扫描 PostgreSQL，因此重启不依赖调用方重放注册意图。
 
-BFF 可通过受保护的 internal HTTP command surface 注册、更新、暂停、恢复和删除通用
-`ScheduleJob`；该 surface 仍只操作 scheduler 内存中的通用任务，不创建或持久化业务
-`ScheduledTask`。
+生产分层：
 
-机器可审查的唯一 HTTP 契约位于 `contract/openapi/v1/openapi.yaml`；`contract/README.md` 记录 owner、
-version 与 provenance；`docs/API_CONTRACT.md` 只解释运行语义，不另建一份可编辑 wire source。
-
-调度核心直接复用成熟的 [`robfig/cron/v3`](https://github.com/robfig/cron)，支持标准 cron 表达式和 `@every`。
-任务由 `SCHEDULER_JOBS_JSON` 注入：
-
-未设置、空字符串或仅包含空白字符的值均按空任务列表处理；也可以显式配置 `[]`。
-
-```json
-[
-  {
-    "name": "maintenance.reconcile",
-    "schedule": "@every 1h",
-    "url": "http://service.internal/internal/commands/reconcile",
-    "method": "POST",
-    "body": {"scope": "scheduled"}
-  }
-]
+```text
+cmd/scheduler/                    组合根、探针、graceful shutdown
+cmd/db-apply-schema/              空数据库 schema 安装命令
+internal/domain/                  Schedule、Occurrence、状态与不变量
+internal/application/             command、planning、dispatch、recovery 用例
+internal/ports/                   Store、Clock、Recurrence、Wakeup、Lease、Target
+internal/adapters/postgres/       durable repository 与事务 claim
+internal/adapters/recurrence/     明确定义的 recurrence calculator
+internal/adapters/gocron/         仅进程唤醒
+internal/adapters/redis/          可选 token-fenced lease
+internal/adapters/httpclient/     timeout、DNS pin、重试分类
+internal/transport/http/          tenant-scoped internal control API
+test/{architecture,contract,schema,integration,smoke,doubles}/
 ```
 
-每个任务由 `name/schedule/url/method/body/retry/misfire_policy/paused` 组成；配置使用严格 JSON 解码，未知字段、越界 retry 值和非法 cron 表达式会在启动时失败。retry policy 使用带最大单次延迟和最大总窗口的 capped exponential backoff + full jitter；默认值为 `max_attempts=1`、`backoff_seconds=1`、`max_backoff_seconds=3600`、`max_retry_window_seconds=3600`。
-HTTP 调用默认 30 秒超时，携带 `X-Kokoro-Scheduler-Job`、规范化 UTC occurrence 的
-`X-Kokoro-Scheduler-Occurrence`、`X-Request-Id` 和按 occurrence 稳定的
-`Idempotency-Key`。配置非空的 `SCHEDULER_TARGET_SERVICE_TOKEN` 后，scheduler 会为每次出站
-dispatch 增加 `Authorization: Bearer <token>`；仅当目标服务契约不要求服务认证时才允许留空。
-该 token 是 Scheduler → 目标服务凭据，与 BFF → Scheduler 使用的
-`SCHEDULER_INTERNAL_SERVICE_TOKEN` 独立。网络错误、429 和 5xx 按 retry policy 重试，每次等待从
-`[0, min(指数退避上限, max_backoff_seconds, 剩余总窗口)]` 独立随机取值，避免多实例同步重试；目标业务
-服务负责持久化幂等 receipt 和业务状态。单实例不需要 Redis；多实例请配置
-`SCHEDULER_REDIS_URL`，用于同一 occurrence 的跨实例 claim。
+## 五分钟启动
 
-默认只允许解析到 global-unicast 的 target。需要访问本地 BFF 或受信内网时，部署可配置严格的
-`SCHEDULER_INTERNAL_TARGET_ALLOWLIST` JSON 数组，例如
-`[{"host":"service.internal","cidrs":["10.0.0.7/32"]}]`。每项必须是精确 DNS host 和 canonical
-private/loopback/IPv6 ULA CIDR；配置存在时仅列出的 host/CIDR pair 可出站，未列出的私网、loopback 和
-其他地址仍被拒绝。解析只执行一次并 pin 地址，仍禁止 redirect，response body 上限为 1 MiB，单次调用受
-overall timeout 限制。
-
-完整契约见：[API_CONTRACT.md](docs/API_CONTRACT.md)。
-
-## Internal HTTP server
-
-生产入口会同时启动 cron 和 HTTP server。默认监听 `:8080`，可通过
-`SCHEDULER_HTTP_ADDR` 调整。`GET /healthz` 与 `GET /readyz` 不需要认证并使用统一
-`data/meta.request_id` envelope；`/readyz` 还会检查调度器已启动，配置 Redis 时执行有超时的实时
-PING。任务 command
-必须使用 `Authorization: Bearer <SCHEDULER_INTERNAL_SERVICE_TOKEN>`、`X-Request-Id`
-和 `Idempotency-Key`。完整路由、严格 JSON 规则和重复注册语义见
-[API_CONTRACT.md](docs/API_CONTRACT.md)。
-
-## 独立仓库使用
+要求：`go 1.26.8`、一个**空的 Scheduler 专用 PostgreSQL database**。本地多实例联调可复用共享 Redis logical DB 7；不要清理其他 logical DB。
 
 ```bash
 git clone https://github.com/LordFoxFairy/kokoro-scheduler.git
 cd kokoro-scheduler
 go mod download
+
+export SCHEDULER_DATABASE_URL='postgresql://USER:PASSWORD@HOST:PORT/EMPTY_SCHEDULER_DATABASE'
+export SCHEDULER_INTERNAL_SERVICE_TOKEN='TOKEN'
+# 可选，且 URL 必须显式选择 /7：
+# export SCHEDULER_REDIS_URL='redis://HOST:PORT/7'
+
+./scripts/db-apply-schema
+go run ./cmd/scheduler
 ```
 
-本仓库不连接业务 PostgreSQL；业务执行事实由目标业务仓库持久化到其 PostgreSQL。
-多实例调度只通过 `SCHEDULER_REDIS_URL` 使用 Redis occurrence lease，Redis 不承载业务事实。
-本仓库不引入 MySQL 或 MongoDB。
-
-## 本地验证
+探针：
 
 ```bash
-gofmt -l .
+curl -fsS http://127.0.0.1:8080/healthz
+curl -fsS http://127.0.0.1:8080/readyz
+```
+
+创建 schedule：
+
+```bash
+curl -fsS -X POST \
+  -H 'Authorization: Bearer TOKEN' \
+  -H 'X-Kokoro-Tenant-Id: tenant-a' \
+  -H 'X-Request-Id: request-001' \
+  -H 'Idempotency-Key: schedule-create-001' \
+  -H 'Content-Type: application/json' \
+  http://127.0.0.1:8080/internal/scheduler/v1/schedules/maintenance.reconcile \
+  --data '{
+    "schedule":"0 2 * * *",
+    "timezone":"America/New_York",
+    "url":"https://service.example/internal/reconcile",
+    "method":"POST",
+    "body":{"scope":"scheduled"},
+    "misfire_policy":"fire_once",
+    "overlap_policy":"forbid",
+    "retry":{"max_attempts":4,"backoff_seconds":2,"max_backoff_seconds":30,"max_retry_window_seconds":300}
+  }'
+```
+
+API 时间均为 RFC3339 UTC；周期规则单独保存 IANA timezone。默认 misfire 为 `fire_once`，默认 overlap 为 `forbid`，每次跳过都会持久化 outcome，不存在无记录的 still-running skip。
+
+## Recurrence contract
+
+支持：
+
+- 五字段 cron：minute、hour、day-of-month、month、day-of-week；
+- `*`、列表、闭区间、step、`JAN`–`DEC`、`SUN`–`SAT`，Sunday 可写 `0` 或 `7`；
+- `@yearly`、`@annually`、`@monthly`、`@weekly`、`@daily`、`@midnight`、`@hourly`；
+- `@every DURATION`，范围 1 秒至 366 天、毫秒精度。
+
+DOM 与 DOW 都受限时使用标准 OR 语义；任一字段为无 step 的 `*` 时由另一字段筛选。不存在的日期在写入前拒绝。DST spring-forward 缺失的本地时刻不触发；fall-back 重复的本地时刻对应两个不同 UTC occurrence。完整语义和测试位置见 [docs/TECHNICAL_DESIGN.md](./docs/TECHNICAL_DESIGN.md)。
+
+## 配置
+
+| 变量 | 必需 | 默认/约束 |
+|---|---:|---|
+| `SCHEDULER_DATABASE_URL` | 是 | Scheduler 专用 PostgreSQL database |
+| `SCHEDULER_REDIS_URL` | 否 | 配置时必须为 `redis://.../7` 或 `rediss://.../7` |
+| `SCHEDULER_HTTP_ADDR` | 否 | `:8080` |
+| `SCHEDULER_INTERNAL_SERVICE_TOKEN` | command 使用时是 | 空值使 command fail closed，探针仍可用 |
+| `SCHEDULER_TARGET_SERVICE_TOKEN` | 否 | 非空时发送独立 outbound Bearer |
+| `SCHEDULER_INTERNAL_TARGET_ALLOWLIST` | 否 | 精确 hostname 与 canonical internal CIDR JSON |
+| `SCHEDULER_WAKEUP_INTERVAL` | 否 | `1s` |
+| `SCHEDULER_CLAIM_TTL` | 否 | `2m`，必须大于 dispatch timeout |
+| `SCHEDULER_DISPATCH_TIMEOUT` | 否 | `30s` |
+| `SCHEDULER_BATCH_SIZE` | 否 | `100`，范围 1–1000 |
+| `SCHEDULER_WORKER_ID` | 否 | hostname 加随机 suffix |
+
+## 验证
+
+真实 integration/smoke 使用独立测试 database；无 URL 时相关测试明确 SKIP。
+
+```bash
+gofmt -w .
+go vet ./...
 go test ./...
 go test -race ./...
-go vet ./...
-go build -trimpath -ldflags='-s -w' -o /tmp/kokoro-scheduler ./cmd/scheduler
-SCHEDULER_REDIS_TEST_URL=redis://127.0.0.1:56380/7 go test -run TestRedisLocker ./...
+go build ./...
+./scripts/contract-check
+
+env \
+  SCHEDULER_DATABASE_TEST_URL='postgresql://USER:PASSWORD@HOST:PORT/kokoro_scheduler_test_RUN' \
+  SCHEDULER_REDIS_TEST_URL='redis://HOST:PORT/7' \
+  go test -count=1 ./test/integration ./test/smoke ./internal/adapters/redis
+
+git diff --check
 ```
 
-`Dockerfile` 从实际生产入口 `./cmd/scheduler` 构建，并以 `/kokoro-scheduler` 作为容器
-`ENTRYPOINT`：
-
-```bash
-docker build -t kokoro-scheduler:local .
-docker run --rm \
-  -p 8080:8080 \
-  -e SCHEDULER_JOBS_JSON='[]' \
-  -e SCHEDULER_INTERNAL_SERVICE_TOKEN=TOKEN \
-  kokoro-scheduler:local
-```
-
-发布到 GHCR 的 workflow 仅响应 `v*.*.*` tag；普通 branch push 和 pull request 只运行检查，
-不会发布镜像。
+`./scripts/db-apply-schema` 只接受空 database namespace，只安装 [`database/schema.sql`](./database/schema.sql)，不是历史升级工具。

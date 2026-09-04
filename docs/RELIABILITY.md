@@ -1,85 +1,67 @@
-# kokoro-scheduler 可靠性设计
+# kokoro-scheduler 可靠性
 
 ## 1. 交付语义
 
-Scheduler 提供 **at-least-once command delivery**，不提供 exactly-once 业务执行。Redis lease 在 26 小时窗口内
-抑制同一 occurrence 的多实例重复触发，但进程崩溃、网络结果不确定、lease 丢失或窗口到期仍可能重复投递。
-目标事实 owner 必须使用稳定 `Idempotency-Key` 保存 durable receipt，并以自己的事务确定业务成功。
+Scheduler 对 target 提供 **durable at-least-once dispatch**：Occurrence 与 outbox 先原子提交，随后才发 HTTP。成功响应与永久失败写回 outbox/occurrence 同一事务。网络结果不确定或 worker 崩溃时可能重投，但 tenant+schedule+scheduled UTC instant 派生的 `Idempotency-Key` 保持稳定。
 
-Scheduler 不持久化 job registry、mutation receipt 或 dispatch history。服务重启后，部署配置恢复静态 job，
-BFF/部署编排重放动态注册；本仓不从业务数据库重建状态。
+目标 owner 必须持久化 request digest/receipt；Scheduler 的 receipt 只覆盖 control mutation，不证明目标业务 command 已成功。
 
-## 2. Occurrence 与 misfire
+## 2. 并发与 claim
 
-- 所有具体时间转 UTC；cron engine 以 UTC 运行。
-- 标准 cron 触发时 `scheduled_at == observed_at == now`；显式恢复调用可分别提供计划和观察时间。
-- `misfire_policy=skip` 丢弃 `observed_at > scheduled_at` 的 occurrence。
-- `misfire_policy=fire_once` 允许该显式 occurrence 继续，但 v1 没有历史窗口扫描器。
-- paused job、stale cron closure 和已被另一实例 claim 的 occurrence 均不调用目标。
+- due Schedule 和 ready/expired outbox 分别使用 PostgreSQL `FOR UPDATE SKIP LOCKED`；
+- claim 包含 worker owner 与 expiry，Application 只允许持有者推进状态；
+- Schedule materialization 以 version+claim 条件完成，竞争更新会回滚整个 occurrence/outbox transaction；
+- occurrence/outbox UNIQUE 约束是并发和重复 wakeup 的最终去重边界；
+- optional Redis lease 是第二层协调，不替代 PostgreSQL claim/UNIQUE。
 
-## 3. Lease 与多实例
+同一进程可收到重叠 wakeup；正确性由 PostgreSQL claim 和业务唯一键保证，不由 timer callback 的进程内状态保证。
 
-1. 未配置 `SCHEDULER_REDIS_URL` 时按单实例运行，不做跨实例去重。
-2. 配置 Redis 时，启动先在 5 秒 deadline 内 PING；失败则进程退出。
-3. dispatch 前以 2 秒 operation timeout 获取 token lease；错误 fail closed，未获取表示其他实例已拥有。
-4. in-flight 时每 `TTL / 3` token-safe renew；renew 失败取消 dispatch，并归类
-   `SCHEDULER_COORDINATION_UNAVAILABLE`。
-5. 成功 dispatch 保留 claim 至 TTL 到期；失败/cancelled dispatch 尝试在独立 2 秒 context 中 release。
+## 3. Restart 与 crash recovery
 
-Redis lease 是并发协调，不是执行日志。即使 lease 正常，目标 endpoint 也必须幂等。
+启动后 Runtime 立即执行 cycle：
 
-## 4. Retry 与 timeout
+1. 重新扫描 `next_due_at <= now` 的 active Schedule；
+2. 按持久化 misfire policy 物化 downtime；
+3. 重领 expiry 已过且 attempt 未耗尽的 outbox；
+4. 将 expiry 已过且 final attempt 已开始的 outbox/occurrence 标为 `SCHEDULER_DISPATCH_RECOVERY_EXHAUSTED`。
 
-| 结果 | 是否由 Scheduler 重试 |
+control receipt 在重建 Service/进程后仍 replay。恢复不要求 BFF 重发 Schedule 注册。
+
+若 worker 在目标接收后、写 success 前崩溃，claim expiry 后会用相同 identity 重投；这是目标幂等边界必须处理的已知 at-least-once 窗口。
+
+## 4. Misfire 与 overlap 可观测性
+
+`skip`、`fire_once`、`catch_up_bounded` 的行为由 Schedule row 决定。skip、bound exceeded、overlap blocked 都写 Occurrence 终态和 outcome code。不存在 timer 级无记录跳过。
+
+暂停期间不创建 occurrence；resume 从当前 instant 重新计算 future due。已创建 outbox 是 durable snapshot，Schedule pause/delete 不撤销已发生的 dispatch obligation。
+
+## 5. Retry 与 timeout
+
+| 结果 | 分类 |
 |---|---|
-| HTTP 2xx | 否，成功 |
-| HTTP 4xx（除 429） | 否，立即失败 |
-| HTTP 429 | 是，预算允许时 |
-| HTTP 5xx | 是，预算允许时 |
-| 网络错误 / timeout | 是，预算允许时 |
-| jitter source、context、lease 错误 | 否，归一失败并停止本次 occurrence |
+| 2xx | succeeded |
+| 408 / 425 / 429 / 5xx | retryable |
+| DNS、connect、read、network error | retryable |
+| per-attempt deadline exceeded | retryable timeout |
+| caller/runtime cancellation | permanent cancellation |
+| 其他非 2xx、redirect、target policy、invalid payload | permanent |
 
-失败 attempt `n` 的等待 ceiling 为：
+重试 delay 为 `uniform(0, min(base*2^(attempt-1), max_backoff, remaining_window))`。`max_attempts`、`max_retry_window_seconds` 和 next-attempt deadline 任一耗尽即终结。随机源失败会 durable fail，不进行无 jitter 重试。
 
-```text
-min(backoff_seconds * 2^(n-1), max_backoff_seconds, retry_window_remaining)
-```
+配置强制 `claim_ttl > dispatch_timeout`，避免仍在合法 HTTP attempt 时被另一个 worker重领。HTTP client另有 dial/TLS/header/overall timeout、context cancellation 和 1 MiB response 上限。
 
-实际等待由操作系统加密随机源在 `[0, ceiling]` 取 full jitter。只有 attempt 数和总窗口都剩余时才开始下一次；
-已开始的 attempt 仍受 30 秒 dispatch timeout 和 process cancellation 约束。Clock、Sleeper、RandomSource 均经
-port 注入，单元测试可确定性验证边界。
+## 6. Redis degradation
 
-当前 HTTP client 只有 30 秒 overall timeout；connect、TLS handshake、response header 尚未拆分预算，登记为
-当前限制而非已完成能力。
+Redis 未配置：PostgreSQL claim/UNIQUE 提供正确性。
 
-## 5. Lifecycle、探针与恢复
+Redis 已配置：必须为 logical DB 7；startup/readiness PING 失败使实例 not-ready。运行期 acquire error 或 contention 会将 outbox durable defer 1 秒并记录 coordination code，不直接 dispatch、不清除事实。不得通过清 DB 7 作为恢复手段；key 自带 TTL，release 使用 token compare/delete。
 
-- 启动：严格解析全部 jobs -> 初始化/探测 Redis（若配置）-> 注册 cron -> 启动 HTTP -> Start scheduler。
-- `/healthz`：只证明进程 listener 可响应。
-- `/readyz`：要求 scheduler 已 Start；配置 Redis 时在 2 秒内实时 PING。
-- shutdown：先将 readiness 置 false、取消 scheduler context、停止 cron，再等待 in-flight；main 的 HTTP 和
-  scheduler shutdown 共使用 10 秒 deadline。
-- job 失败只结束本次 occurrence，不停止整个 scheduler。
-- registry/receipt 重建依赖静态配置和外部 replay；rollback 不删除任何业务数据，因为本仓没有业务数据库。
+## 7. Shutdown
 
-## 6. 风险登记
+SIGINT/SIGTERM 后：readiness 关闭，HTTP server shutdown，Runtime context cancellation，gocron shutdown，并等待 in-flight cycle，整体 deadline 10 秒。caller cancellation会写 permanent cancellation（若 transaction context仍可提交）；进程在提交前退出时由 claim expiry recovery 收敛。
 
-| 风险 | 影响 | 当前控制 | 剩余状态 / owner |
-|---|---|---|---|
-| 进程重启丢失动态 registry 与 receipt | job 暂停触发或 mutation 无法 replay | 静态配置重载；BFF/部署 replay | 已知；部署/consumer 必须保存注册意图 |
-| v1 不扫描历史窗口 | downtime 内 occurrence 可能跳过 | 显式 misfire policy；不虚构恢复 | 已知；调用方决定是否显式补发 |
-| Redis lease 过期、清空或不可用 | 重复或停止 dispatch | renew、token fencing、fail closed、目标幂等 | 剩余重复风险由目标 owner receipt 收敛 |
-| 目标 command 非幂等 | retry/不确定结果造成重复副作用 | 稳定 `Idempotency-Key` 契约 | 接入阻断项；目标 owner 负责 durable receipt |
-| 多实例同步重试 | 下游流量尖峰 | capped exponential backoff + crypto full jitter | 已控制，仍需下游 capacity/rate limit |
-| 动态 URL 指向非内部地址 | 数据/credential 边界扩大 | scheme/host/userinfo/port 校验、默认特殊地址拒绝、显式 internal host/CIDR allowlist、单次 DNS pin、部署 egress policy | allowlist 只覆盖精确声明的内部 pair；部署/security owner 仍负责 egress |
-| shared token 泄漏 | 未授权 registry 变更或 target 调用 | secret 注入、分离 inbound/outbound token、日志 redaction | 需要轮换与 secret manager；部署 owner |
-| 可观测性未落 metrics exporter | SLO 无法直接计算 | 稳定日志字段与 SLO 指标契约 | 未实现；部署 observability owner |
+## 8. 当前观测与缺口
 
-## 7. 可观测性与错误预算
+当前实现输出 structured background/dispatch logs，包含 operation、tenant、schedule、result、attempt、code、request/trace identity 和 duration；不记录 token 或 payload。`/healthz` 与 `/readyz` 可检查 lifecycle/dependency。
 
-dispatch 日志至少包含 `service`、`operation`、`request_id`、`trace_id`、`result`、`status`、`attempts`、
-`code`、`duration_ms`，且不记录 token/body。指标名、30 天目标和 burn-rate 告警见 [`SLO.md`](./SLO.md)；
-实际 exporter/dashboard/alert rule 未落地前，不将目标写成实测结果。
-
-诊断、重放和回滚步骤见 [`RUNBOOK.md`](./RUNBOOK.md)，可执行场景见
-[`ACCEPTANCE.md`](./ACCEPTANCE.md)。
+尚未实现 metrics exporter、backlog dashboard、PrometheusRule、retention worker 和 operator-facing Occurrence query API。这些缺口在 [`CURRENT.md`](./CURRENT.md) 与 [`SLO.md`](./SLO.md) 保持显式，不用日志推断 exactly-once 或业务成功。

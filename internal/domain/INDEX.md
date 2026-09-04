@@ -1,6 +1,7 @@
 # domain 架构地图
 
-保存 `Job`、`RetryPolicy`、`Occurrence` 和 `RunResult`，以及调度名称、URL、cron、重试和 misfire
-不变量。这里不处理 HTTP 请求、Redis lease、日志、定时器和业务仓库。
+- `schedule.go`：Schedule、retry/misfire/overlap/status值、tenant/URL/payload不变量；
+- `occurrence.go`：Occurrence/outbox状态与outcome code、稳定dispatch identity、retry分类；
+- `command.go`：control command/result与durable receipt模型。
 
-新增领域规则放在本目录；不要把 target client、Redis key 或 transport response 放入 domain。
+Domain仅依赖Go标准库。recurrence parser、SQL、HTTP DTO、Redis key和timer实现不进入本目录。

@@ -1,4 +1,5 @@
 # transport 架构地图
 
-`http/` 只负责 internal HTTP 的认证、请求解析、幂等 response replay、错误映射和健康探针。
-它通过 application interface 操作 Scheduler，不执行 SQL、不直接操作 Redis、不编排业务规则。
+`http/` 实现 canonical internal control surface：probes、service Bearer、trusted tenant/request/idempotency headers、strict JSON、Application command映射、durable receipt response replay和稳定error envelope。
+
+Transport不执行SQL，不保存进程内事实，不操作Redis/gocron，也不决定misfire/retry状态机。字段与route必须和`contract/openapi/v1/openapi.yaml` parity。
