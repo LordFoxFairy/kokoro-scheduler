@@ -24,6 +24,16 @@ Run the blocking contract gate:
 
 The gate parses the canonical artifact, resolves every local `$ref`, verifies all operation governance extensions, checks Schedule/Occurrence/dispatch fields, exercises every declared control route against the Go handler, and compares dispatch headers with the concrete HTTP adapter. Empty documents and human-only descriptions do not pass.
 
+## Generation
+
+`contract/openapi/v1/openapi.yaml` is the canonical, owner-authored OpenAPI source; it is not generated from a second schema or code generator (`contract/manifest.json` records `generated: false`). Edit this artifact together with the implementation when the wire contract changes. The repository's authoritative generation/contract check is:
+
+```bash
+./scripts/contract-check
+```
+
+This command validates the canonical OpenAPI artifact and runs the contract/parity tests; no separate generator command is defined in this repository.
+
 ## Breaking policy
 
 [`openapi/v1/breaking-policy.json`](./openapi/v1/breaking-policy.json) is the v1 compatibility signature. The gate fails when a protected path, method, Schedule input field, Occurrence field, dispatch header, or retryable status is removed. Tightening constraints or changing semantics still requires owner review; an incompatible change must use a new major contract and coordinated consumer update rather than a runtime compatibility route.
