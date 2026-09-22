@@ -84,5 +84,22 @@
     "backoff_seconds",
     "max_backoff_seconds",
     "max_retry_window_seconds"
-  ]
+  ],
+  "required_control_errors": {
+    "createSchedule": {
+      "409": "schedule_already_exists"
+    },
+    "replaceSchedule": {
+      "404": "schedule_not_found"
+    },
+    "deleteSchedule": {
+      "404": "schedule_not_found"
+    },
+    "pauseSchedule": {
+      "404": "schedule_not_found"
+    },
+    "resumeSchedule": {
+      "404": "schedule_not_found"
+    }
+  }
 }

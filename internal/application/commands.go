@@ -89,7 +89,6 @@ func (s *Service) prepare(command Command) (Command, error) {
 	command.TenantID = strings.TrimSpace(command.TenantID)
 	command.Name = strings.TrimSpace(command.Name)
 	command.CommandScope = strings.TrimSpace(command.CommandScope)
-	command.IdempotencyKey = strings.TrimSpace(command.IdempotencyKey)
 	command.RequestID = strings.TrimSpace(command.RequestID)
 	if err := domain.ValidateTenantID(command.TenantID); err != nil {
 		return Command{}, errors.Join(ErrInvalidCommand, err)

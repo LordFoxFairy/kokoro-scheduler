@@ -109,6 +109,9 @@
           "500": {
             "$ref": "#/components/responses/Error"
           }
+        },
+        "x-kokoro-control-error-codes": {
+          "409": "schedule_already_exists"
         }
       },
       "put": {
@@ -158,6 +161,9 @@
           "500": {
             "$ref": "#/components/responses/Error"
           }
+        },
+        "x-kokoro-control-error-codes": {
+          "404": "schedule_not_found"
         }
       },
       "delete": {
@@ -207,6 +213,9 @@
               }
             }
           }
+        },
+        "x-kokoro-control-error-codes": {
+          "404": "schedule_not_found"
         }
       }
     },
@@ -266,6 +275,9 @@
           "500": {
             "$ref": "#/components/responses/Error"
           }
+        },
+        "x-kokoro-control-error-codes": {
+          "404": "schedule_not_found"
         }
       }
     },
@@ -325,6 +337,9 @@
           "500": {
             "$ref": "#/components/responses/Error"
           }
+        },
+        "x-kokoro-control-error-codes": {
+          "404": "schedule_not_found"
         }
       }
     }

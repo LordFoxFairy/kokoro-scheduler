@@ -36,7 +36,7 @@ This command validates the canonical OpenAPI artifact and runs the contract/pari
 
 ## Breaking policy
 
-[`openapi/v1/breaking-policy.json`](./openapi/v1/breaking-policy.json) is the v1 compatibility signature. The gate fails when a protected path, method, Schedule input field, Occurrence field, dispatch header, or retryable status is removed. Tightening constraints or changing semantics still requires owner review; an incompatible change must use a new major contract and coordinated consumer update rather than a runtime compatibility route.
+[`openapi/v1/breaking-policy.json`](./openapi/v1/breaking-policy.json) is the v1 compatibility signature. The gate fails when a protected path, method, Schedule input field, Occurrence field, dispatch header, retryable status, or stable control error mapping is removed. The canonical OpenAPI declares each operation's status-to-code mapping through `x-kokoro-control-error-codes`; the policy captures the required signature by `operationId`, and the contract test rejects any drift between the two. The protected owner codes are `schedule_already_exists` and `schedule_not_found`. Tightening constraints or changing semantics still requires owner review; an incompatible change must use a new major contract and coordinated consumer update rather than a runtime compatibility route.
 
 Change order:
 

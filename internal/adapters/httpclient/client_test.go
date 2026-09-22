@@ -26,7 +26,7 @@ func TestClientDispatchUsesTenantScopedRFC3339IdentityAndTargetAuth(t *testing.T
 		t.Fatalf("result = %#v", result)
 	}
 	identity := domain.OccurrenceIdentity(work.ScheduleSnapshot(), work.ScheduledAt)
-	if got.Get(OccurrenceHeader) != "2026-01-02T08:04:05Z" || got.Get(RequestIDHeader) != identity.RequestID || got.Get(IdempotencyHeader) != identity.IdempotencyKey {
+	if got.Get(OccurrenceHeader) != "2026-01-02T08:04:05.123Z" || got.Get(RequestIDHeader) != identity.RequestID || got.Get(IdempotencyHeader) != identity.IdempotencyKey {
 		t.Fatalf("unexpected identity headers: %#v", got)
 	}
 	if got.Get(TenantHeader) != "tenant-a" || got.Get(ScheduleHeader) != "billing.reconcile" {
@@ -185,7 +185,7 @@ func testWork() domain.DispatchWork {
 		ID: "00000000-0000-0000-0000-000000000003", TenantID: "tenant-a",
 		OccurrenceID: "00000000-0000-0000-0000-000000000002",
 		ScheduleID:   "00000000-0000-0000-0000-000000000001", ScheduleName: "billing.reconcile",
-		ScheduledAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.FixedZone("fixture", -5*60*60)),
+		ScheduledAt: time.Date(2026, 1, 2, 3, 4, 5, 123_000_000, time.FixedZone("fixture", -5*60*60)),
 		TargetURL:   "http://service.test/command", Method: domain.MethodPost,
 		Payload: []byte(`{"tenant_id":"tenant-a"}`), Retry: domain.DefaultRetryPolicy(),
 	}

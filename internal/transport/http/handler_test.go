@@ -18,13 +18,17 @@ import (
 const testToken = "scheduler-internal-token"
 
 type stubCommandService struct {
-	mu       sync.Mutex
-	receipts map[string]domain.CommandReceipt
-	commands []application.Command
+	mu                    sync.Mutex
+	receipts              map[string]domain.CommandReceipt
+	commands              []application.Command
+	resultCodeByOperation map[domain.CommandOperation]string
 }
 
 func newStubCommandService() *stubCommandService {
-	return &stubCommandService{receipts: make(map[string]domain.CommandReceipt)}
+	return &stubCommandService{
+		receipts:              make(map[string]domain.CommandReceipt),
+		resultCodeByOperation: make(map[domain.CommandOperation]string),
+	}
 }
 
 func (s *stubCommandService) Execute(_ context.Context, command application.Command) (domain.CommandReceipt, error) {
@@ -57,6 +61,10 @@ func (s *stubCommandService) Execute(_ context.Context, command application.Comm
 		result.Code = domain.ResultPaused
 	case domain.CommandResume:
 		result.Code = domain.ResultResumed
+	}
+	if code, found := s.resultCodeByOperation[command.Operation]; found {
+		result.Code = code
+		result.Schedule = nil
 	}
 	receipt := domain.CommandReceipt{
 		TenantID: command.TenantID, CommandScope: command.CommandScope,
@@ -126,6 +134,83 @@ func TestHandlerScopesSameCommandIdentityByTrustedTenant(t *testing.T) {
 	}
 	if got := len(service.receipts); got != 2 {
 		t.Fatalf("tenant-scoped receipts = %d, want 2", got)
+	}
+}
+
+func TestHandlerMapsStableControlResultsToCanonicalErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		resultCode string
+		wantStatus int
+		wantCode   string
+		body       string
+	}{
+		{
+			name: "duplicate create", method: http.MethodPost, resultCode: domain.ResultAlreadyExists,
+			wantStatus: http.StatusConflict, wantCode: "schedule_already_exists",
+			body: `{"schedule":"@every 1m","url":"http://service.test/command"}`,
+		},
+		{
+			name: "missing replace", method: http.MethodPut, resultCode: domain.ResultNotFound,
+			wantStatus: http.StatusNotFound, wantCode: "schedule_not_found",
+			body: `{"schedule":"@every 1m","url":"http://service.test/command"}`,
+		},
+		{
+			name: "missing delete", method: http.MethodDelete, resultCode: domain.ResultNotFound,
+			wantStatus: http.StatusNotFound, wantCode: "schedule_not_found",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := newStubCommandService()
+			service.resultCodeByOperation[operationFor(test.method, "")] = test.resultCode
+			response := httptest.NewRecorder()
+			NewHTTPHandler(service, testToken, nil).ServeHTTP(response, internalRequest(
+				test.method, SchedulesPathPrefix+"billing.reconcile", test.body,
+				"req-control-result", "control-result-key", "tenant-a",
+			))
+			if response.Code != test.wantStatus {
+				t.Fatalf("status=%d body=%s, want %d", response.Code, response.Body.String(), test.wantStatus)
+			}
+			var envelope struct {
+				Error struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+				t.Fatal(err)
+			}
+			if envelope.Error.Code != test.wantCode {
+				t.Fatalf("error code=%q body=%s, want %q", envelope.Error.Code, response.Body.String(), test.wantCode)
+			}
+		})
+	}
+}
+
+func TestHandlerPreservesLegalOpaqueIdempotencyKeyAtApplicationBoundary(t *testing.T) {
+	service := newStubCommandService()
+	key := "\u00a0AbC-._~:/?@!$&'()*+,;=[]{}#%\u00a0"
+	server := httptest.NewServer(NewHTTPHandler(service, testToken, nil))
+	defer server.Close()
+	request, err := http.NewRequest(http.MethodDelete, server.URL+SchedulesPathPrefix+"billing.reconcile", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+testToken)
+	request.Header.Set(requestIDHeader, "req-opaque-key")
+	request.Header.Set(idempotencyKeyHeader, key)
+	request.Header.Set(tenantIDHeader, "tenant-a")
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want %d", response.StatusCode, http.StatusOK)
+	}
+	if got := service.lastCommand().IdempotencyKey; got != key {
+		t.Fatalf("application idempotency key=%q, want byte-for-byte %q", got, key)
 	}
 }
 

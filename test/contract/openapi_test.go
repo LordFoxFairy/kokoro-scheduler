@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -194,14 +195,15 @@ func TestOccurrenceAndDispatchProtocolAreMachineReadable(t *testing.T) {
 func TestBreakingPolicyProtectsCurrentRequiredSurface(t *testing.T) {
 	document := loadOpenAPI(t)
 	var policy struct {
-		ContractMajor               int                 `json:"contract_major"`
-		RequiredPaths               map[string][]string `json:"required_paths"`
-		RequiredScheduleInputFields []string            `json:"required_schedule_input_fields"`
-		RequiredScheduleFields      []string            `json:"required_schedule_response_fields"`
-		RequiredResolvedRetryFields []string            `json:"required_resolved_retry_fields"`
-		RequiredOccurrenceFields    []string            `json:"required_occurrence_fields"`
-		RequiredDispatchHeaders     []string            `json:"required_dispatch_headers"`
-		RequiredRetryableStatuses   []string            `json:"required_retryable_statuses"`
+		ContractMajor               int                          `json:"contract_major"`
+		RequiredPaths               map[string][]string          `json:"required_paths"`
+		RequiredScheduleInputFields []string                     `json:"required_schedule_input_fields"`
+		RequiredScheduleFields      []string                     `json:"required_schedule_response_fields"`
+		RequiredResolvedRetryFields []string                     `json:"required_resolved_retry_fields"`
+		RequiredOccurrenceFields    []string                     `json:"required_occurrence_fields"`
+		RequiredDispatchHeaders     []string                     `json:"required_dispatch_headers"`
+		RequiredRetryableStatuses   []string                     `json:"required_retryable_statuses"`
+		RequiredControlErrors       map[string]map[string]string `json:"required_control_errors"`
 	}
 	readJSON(t, repositoryPath(t, "contract/openapi/v1/breaking-policy.json"), &policy)
 	if !strings.HasPrefix(document.Info.Version, strconv.Itoa(policy.ContractMajor)+".") {
@@ -239,6 +241,49 @@ func TestBreakingPolicyProtectsCurrentRequiredSurface(t *testing.T) {
 		if !contains(retryable, status) {
 			t.Errorf("breaking change removed retryable dispatch status %s", status)
 		}
+	}
+	if len(policy.RequiredControlErrors) == 0 {
+		t.Fatal("breaking policy must protect stable control error codes by operation and HTTP status")
+	}
+	declared := make(map[string]map[string]string)
+	stableCodes := make(map[string]struct{})
+	for _, item := range document.Paths {
+		for method, raw := range item {
+			if method == "parameters" {
+				continue
+			}
+			operation := raw.(map[string]any)
+			operationID := operation["operationId"].(string)
+			_, found := operation["x-kokoro-control-error-codes"]
+			if !found {
+				continue
+			}
+			errorsByStatus := object(t, operation, "x-kokoro-control-error-codes")
+			declared[operationID] = make(map[string]string, len(errorsByStatus))
+			responses := object(t, operation, "responses")
+			for status, rawCode := range errorsByStatus {
+				code, ok := rawCode.(string)
+				if !ok || code == "" {
+					t.Fatalf("%s control error %s = %#v, want a stable string code", operationID, status, rawCode)
+				}
+				if _, found := responses[status]; !found {
+					t.Errorf("%s maps control error %s to undeclared response status %s", operationID, code, status)
+				}
+				declared[operationID][status] = code
+				stableCodes[code] = struct{}{}
+			}
+		}
+	}
+	if !reflect.DeepEqual(declared, policy.RequiredControlErrors) {
+		t.Fatalf("OpenAPI control errors %#v do not match breaking policy %#v", declared, policy.RequiredControlErrors)
+	}
+	for _, code := range []string{"schedule_already_exists", "schedule_not_found"} {
+		if _, found := stableCodes[code]; !found {
+			t.Errorf("stable control error set is missing %s", code)
+		}
+	}
+	if len(stableCodes) != 2 {
+		t.Fatalf("stable control error set = %#v, want exactly the two owner control codes", stableCodes)
 	}
 }
 

@@ -113,6 +113,74 @@ func TestPostgresCommandReceiptSurvivesServiceReconstructionAndIsolatesTenants(t
 	}
 }
 
+func TestPostgresCommandReceiptPreservesOpaqueIdempotencyIdentity(t *testing.T) {
+	store, pool := openIntegrationStore(t)
+	clock := doubles.NewClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	service, err := application.NewService(store, clock, recurrence.NewCalculator())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	coreKey := `AbC-._~:/?@!$&'()*+,;=[]{}#%`
+	opaqueKey := "\u00a0" + coreKey + "\u00a0"
+	scope := "DELETE:/internal/scheduler/v1/schedules/opaque-key"
+	opaque := application.Command{
+		Operation: domain.CommandDelete, TenantID: "tenant-a", Name: "opaque-key",
+		CommandScope: scope, IdempotencyKey: opaqueKey, RequestDigest: digest(scope + ":payload"), RequestID: "request-opaque",
+	}
+	first, err := service.Execute(context.Background(), opaque)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := service.Execute(context.Background(), opaque)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.RequestID != first.RequestID || replay.IdempotencyKey != opaqueKey {
+		t.Fatalf("opaque replay=%#v, original=%#v", replay, first)
+	}
+
+	trimmed := opaque
+	trimmed.IdempotencyKey = coreKey
+	trimmed.RequestID = "request-trimmed"
+	second, err := service.Execute(context.Background(), trimmed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.RequestID != "request-trimmed" || second.IdempotencyKey != coreKey {
+		t.Fatalf("distinct trimmed key was aliased to opaque receipt: %#v", second)
+	}
+
+	conflict := opaque
+	conflict.RequestDigest = digest("opaque-different-payload")
+	if _, err := service.Execute(context.Background(), conflict); !errors.Is(err, application.ErrIdempotencyConflict) {
+		t.Fatalf("same opaque key with different digest error=%v, want idempotency conflict", err)
+	}
+
+	rows, err := pool.Query(context.Background(), `
+		SELECT idempotency_key
+		  FROM scheduler_command_receipt
+		 WHERE tenant_id = $1 AND command_scope = $2`, opaque.TenantID, opaque.CommandScope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	keys := make(map[string]bool)
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			t.Fatal(err)
+		}
+		keys[key] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 2 || !keys[opaqueKey] || !keys[coreKey] {
+		t.Fatalf("persisted receipt keys=%#v, want distinct opaque and trimmed identities", keys)
+	}
+}
+
 func TestPostgresDuePlanningIsAtomicAndDuplicateSafeAcrossWorkers(t *testing.T) {
 	store, pool := openIntegrationStore(t)
 	clock := doubles.NewClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))

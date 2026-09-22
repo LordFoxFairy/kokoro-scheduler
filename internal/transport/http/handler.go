@@ -123,7 +123,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, errorResponse("method_not_allowed", "method not allowed", requestID))
 		return
 	}
-	idempotencyKey := strings.TrimSpace(r.Header.Get(idempotencyKeyHeader))
+	idempotencyKey := r.Header.Get(idempotencyKeyHeader)
 	if err := validateIdempotencyKey(idempotencyKey); err != nil {
 		code := "invalid_idempotency_key"
 		if idempotencyKey == "" {
