@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -110,6 +111,139 @@ func TestPostgresCommandReceiptSurvivesServiceReconstructionAndIsolatesTenants(t
 	conflict.RequestDigest = digest("different-payload")
 	if _, err := reconstructed.Execute(context.Background(), conflict); !errors.Is(err, application.ErrIdempotencyConflict) {
 		t.Fatalf("conflicting replay error = %v", err)
+	}
+}
+
+func TestPostgresDuplicateCreateWithNewKeyPersistsAndReplaysAlreadyExists(t *testing.T) {
+	store, pool := openIntegrationStore(t)
+	clock := doubles.NewClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	service, err := application.NewService(store, clock, recurrence.NewCalculator())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	createdCommand := createCommand("tenant-a", "durable-duplicate", "key-created", "request-created")
+	created, err := service.Execute(context.Background(), createdCommand)
+	if err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	if created.Result.Code != domain.ResultRegistered || created.Result.Schedule == nil {
+		t.Fatalf("first result = %#v, want registered schedule", created.Result)
+	}
+
+	duplicateCommand := createCommand("tenant-a", "durable-duplicate", "key-duplicate", "request-duplicate")
+	duplicate, err := service.Execute(context.Background(), duplicateCommand)
+	if err != nil {
+		t.Fatalf("duplicate create with new key: %v", err)
+	}
+	if duplicate.Result.Code != domain.ResultAlreadyExists || duplicate.Result.Schedule != nil {
+		t.Fatalf("duplicate result = %#v, want schedule_already_exists without schedule", duplicate.Result)
+	}
+
+	var schedules, receipts int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*)
+		  FROM scheduler_schedule
+		 WHERE tenant_id = $1 AND name = $2`, "tenant-a", "durable-duplicate").Scan(&schedules); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*)
+		  FROM scheduler_command_receipt
+		 WHERE tenant_id = $1 AND command_scope = $2`, "tenant-a", createdCommand.CommandScope).Scan(&receipts); err != nil {
+		t.Fatal(err)
+	}
+	if schedules != 1 || receipts != 2 {
+		t.Fatalf("schedule count=%d receipt count=%d, want 1/2", schedules, receipts)
+	}
+
+	reconstructed, err := application.NewService(store, clock, recurrence.NewCalculator())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expectation := range []struct {
+		name     string
+		command  application.Command
+		original domain.CommandReceipt
+	}{
+		{name: "created", command: createdCommand, original: created},
+		{name: "already exists", command: duplicateCommand, original: duplicate},
+	} {
+		t.Run(expectation.name, func(t *testing.T) {
+			replayCommand := expectation.command
+			replayCommand.RequestID = "request-replay-" + strings.ReplaceAll(expectation.name, " ", "-")
+			replay, err := reconstructed.Execute(context.Background(), replayCommand)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if replay.RequestID != expectation.original.RequestID || !reflect.DeepEqual(replay.Result, expectation.original.Result) {
+				t.Fatalf("replay request/result = %#v/%#v, original = %#v/%#v", replay.RequestID, replay.Result, expectation.original.RequestID, expectation.original.Result)
+			}
+		})
+	}
+}
+
+func TestPostgresConcurrentDuplicateCreatesWithNewKeysConverge(t *testing.T) {
+	store, pool := openIntegrationStore(t)
+	clock := doubles.NewClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	service, err := application.NewService(store, clock, recurrence.NewCalculator())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	commands := []application.Command{
+		createCommand("tenant-a", "concurrent-duplicate", "key-concurrent-a", "request-concurrent-a"),
+		createCommand("tenant-a", "concurrent-duplicate", "key-concurrent-b", "request-concurrent-b"),
+	}
+	type outcome struct {
+		receipt domain.CommandReceipt
+		err     error
+	}
+	outcomes := make(chan outcome, len(commands))
+	start := make(chan struct{})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, command := range commands {
+		command := command
+		go func() {
+			<-start
+			receipt, err := service.Execute(ctx, command)
+			outcomes <- outcome{receipt: receipt, err: err}
+		}()
+	}
+	close(start)
+
+	resultCounts := map[string]int{}
+	for range commands {
+		select {
+		case result := <-outcomes:
+			if result.err != nil {
+				t.Fatalf("concurrent create: %v", result.err)
+			}
+			resultCounts[result.receipt.Result.Code]++
+		case <-ctx.Done():
+			t.Fatalf("concurrent creates did not finish within bound: %v", ctx.Err())
+		}
+	}
+	if resultCounts[domain.ResultRegistered] != 1 || resultCounts[domain.ResultAlreadyExists] != 1 {
+		t.Fatalf("concurrent result counts = %#v, want one registered and one already exists", resultCounts)
+	}
+
+	var schedules, receipts int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*)
+		  FROM scheduler_schedule
+		 WHERE tenant_id = $1 AND name = $2`, "tenant-a", "concurrent-duplicate").Scan(&schedules); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*)
+		  FROM scheduler_command_receipt
+		 WHERE tenant_id = $1 AND command_scope = $2`, "tenant-a", commands[0].CommandScope).Scan(&receipts); err != nil {
+		t.Fatal(err)
+	}
+	if schedules != 1 || receipts != 2 {
+		t.Fatalf("schedule count=%d receipt count=%d, want 1/2", schedules, receipts)
 	}
 }
 

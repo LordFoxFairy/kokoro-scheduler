@@ -8,7 +8,6 @@ import (
 
 	"github.com/LordFoxFairy/kokoro-scheduler/internal/domain"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func (s *txStore) LockCommandIdentity(ctx context.Context, tenantID, scope, idempotencyKey string) error {
@@ -69,7 +68,8 @@ func (s *txStore) CreateSchedule(ctx context.Context, schedule domain.Schedule) 
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
             $12, $13, $14, $15, $16, $17, $17
-        ) RETURNING ` + scheduleColumns
+        ) ON CONFLICT ON CONSTRAINT uq_scheduler_schedule_tenant_name DO NOTHING
+          RETURNING ` + scheduleColumns
 	created, err := scanSchedule(s.tx.QueryRow(ctx, query,
 		schedule.TenantID, schedule.Name, schedule.Rule, schedule.Timezone,
 		schedule.TargetURL, schedule.Method, schedule.Payload, schedule.Status,
@@ -77,7 +77,7 @@ func (s *txStore) CreateSchedule(ctx context.Context, schedule domain.Schedule) 
 		schedule.Retry.MaxAttempts, schedule.Retry.BackoffSeconds, schedule.Retry.MaxBackoffSeconds,
 		schedule.Retry.MaxRetryWindowSeconds, schedule.NextDueAt, schedule.CreatedAt,
 	))
-	if isConstraint(err, "uq_scheduler_schedule_tenant_name") {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Schedule{}, domain.ErrScheduleAlreadyExists
 	}
 	return created, err
@@ -148,9 +148,4 @@ func (s *txStore) GetSchedule(ctx context.Context, tenantID, name string) (domai
 		return domain.Schedule{}, domain.ErrScheduleNotFound
 	}
 	return schedule, err
-}
-
-func isConstraint(err error, name string) bool {
-	var postgresError *pgconn.PgError
-	return errors.As(err, &postgresError) && postgresError.Code == "23505" && postgresError.ConstraintName == name
 }
