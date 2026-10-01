@@ -1,3 +1,9 @@
+## WIN09-R31：cron 大 step 整数溢出局部修复（2026-10-01）
+
+基线 main 975dee59616a1e0eda609aa69283401344900d83。现 recurrence/cron 在递增前检查剩余范围，避免合法大正整数 step 溢出导致下一次分钟提前；原 Sunday 0/7 归一及标准范围行为保持。现 calculator_test 新最大 int/最大 int-1 两案例；旧实现一子例失败，worker 聚焦20主测试/11子例通过，独立审查本片0P0/P1/P2。契约、Schema、依赖及进程无变动。
+
+Root 当前主树 GOMAXPROCS=2/GOPROXY=off：go vet ./...、go test -p 1 -count=1 -timeout=90s ./... -v、go build ./... 全退出0；**82 主测试 passed /12 既有资源 skip /0 failed**；两文件 gofmt 输出为空，diff-check 通过；日志 /tmp/kokoro-r31-scheduler-root-full.log。真实PG/Redis/源码重启集成本轮未运行，局部时间规则修复不等于独立任务整体闭环。只提交本两文件及本 CURRENT，其他 owner 修改保留。
+
 # kokoro-scheduler 当前状态
 
 更新日期：2026-09-04。本文只描述当前工作树对应的实现；最终证据以提交后的命令输出为准。

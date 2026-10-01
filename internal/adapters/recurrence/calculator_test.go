@@ -1,6 +1,7 @@
 package recurrence
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -111,6 +112,25 @@ func TestCalculatorUsesNumberStepThroughFieldMaximum(t *testing.T) {
 	}
 	if want := time.Date(2026, 1, 5, 9, 20, 0, 0, time.UTC); !next.Equal(want) {
 		t.Fatalf("next = %s, want number/step continuation %s", next, want)
+	}
+}
+
+func TestCalculatorLargeStepDoesNotWrapToEarlierMinute(t *testing.T) {
+	calculator := NewCalculator()
+	maximumInt := int(^uint(0) >> 1)
+	after := time.Date(2026, 1, 5, 9, 2, 0, 0, time.UTC)
+	want := time.Date(2026, 1, 6, 9, 2, 0, 0, time.UTC)
+	for _, step := range []int{maximumInt, maximumInt - 1} {
+		rule := fmt.Sprintf("2/%d 9 * * *", step)
+		t.Run(rule, func(t *testing.T) {
+			next, err := calculator.Next(rule, "UTC", after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !next.Equal(want) {
+				t.Fatalf("next = %s, want %s; step exceeds the remaining minute range", next, want)
+			}
+		})
 	}
 }
 

@@ -99,9 +99,13 @@ func parseCronField(raw string, minimum, maximum int, names map[string]int, norm
 		for value := start; value <= end; value += step {
 			if normalizeSunday && value == 7 {
 				field.allowed[0] = struct{}{}
-				continue
+			} else {
+				field.allowed[value] = struct{}{}
 			}
-			field.allowed[value] = struct{}{}
+			// Stop before adding a step that exceeds the range or overflows int.
+			if step > end-value {
+				break
+			}
 		}
 	}
 	return field, nil
