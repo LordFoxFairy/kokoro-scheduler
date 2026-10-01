@@ -2,13 +2,13 @@ package integration_test
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
-	"path/filepath"
 	"reflect"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -65,6 +65,194 @@ func TestApplySchemaInstallsOnlyIntoAnEmptyDatabaseNamespace(t *testing.T) {
 	if err := postgresadapter.ApplySchemaToEmptyDatabase(ctx, pool); err == nil || !strings.Contains(err.Error(), "requires an empty database") {
 		t.Fatalf("second apply error = %v, want non-empty rejection", err)
 	}
+}
+
+func TestIntegrationStoreIsolatesStoresSharingBaseURL(t *testing.T) {
+	admin, baseSchema, neighborSchema := prepareStoreBoundaryFixture(t)
+	_, firstPool := openIntegrationStore(t)
+	firstSchema := integrationStoreSchema(t, firstPool)
+	seedBoundarySentinel(t, firstPool, "first-store")
+	firstSnapshot := boundarySentinelSnapshot(t, admin, firstSchema, "first-store")
+
+	_, secondPool := openIntegrationStore(t)
+	secondSchema := integrationStoreSchema(t, secondPool)
+	if firstSchema == secondSchema {
+		t.Errorf("same base URL produced the same store schema %q", firstSchema)
+	}
+	for _, schema := range []string{firstSchema, secondSchema} {
+		if schema == baseSchema || schema == neighborSchema {
+			t.Errorf("store reused fixture neighbor namespace %q instead of owning an isolated schema", schema)
+		}
+	}
+	if got := boundarySentinelSnapshot(t, admin, firstSchema, "first-store"); got != firstSnapshot {
+		t.Errorf("second store initialization changed first store facts: got %s, want %s", got, firstSnapshot)
+	}
+}
+
+func TestIntegrationStorePreservesNeighborSentinels(t *testing.T) {
+	admin, baseSchema, neighborSchema := prepareStoreBoundaryFixture(t)
+	baseBefore := boundarySentinelSnapshot(t, admin, baseSchema, "fixture-sentinel")
+	neighborBefore := boundarySentinelSnapshot(t, admin, neighborSchema, "fixture-sentinel")
+	openIntegrationStore(t)
+	if got := boundarySentinelSnapshot(t, admin, baseSchema, "fixture-sentinel"); got != baseBefore {
+		t.Errorf("store initialization changed base namespace sentinel: got %s, want %s", got, baseBefore)
+	}
+	if got := boundarySentinelSnapshot(t, admin, neighborSchema, "fixture-sentinel"); got != neighborBefore {
+		t.Errorf("store initialization changed adjacent namespace sentinel: got %s, want %s", got, neighborBefore)
+	}
+}
+
+func TestIntegrationStoreCleanupDropsOnlyOwnNamespace(t *testing.T) {
+	admin, baseSchema, neighborSchema := prepareStoreBoundaryFixture(t)
+	neighborBefore := boundarySentinelSnapshot(t, admin, neighborSchema, "fixture-sentinel")
+	_, survivorPool := openIntegrationStore(t)
+	survivorSchema := integrationStoreSchema(t, survivorPool)
+	seedBoundarySentinel(t, survivorPool, "survivor-store")
+	survivorBefore := boundarySentinelSnapshot(t, admin, survivorSchema, "survivor-store")
+	var ownedSchema string
+	t.Run("owned store lifetime", func(t *testing.T) {
+		_, ownedPool := openIntegrationStore(t)
+		ownedSchema = integrationStoreSchema(t, ownedPool)
+		if ownedSchema == survivorSchema || ownedSchema == baseSchema || ownedSchema == neighborSchema {
+			t.Errorf("child store does not own a distinct namespace: %q", ownedSchema)
+		}
+	})
+	if ownedSchema == "" {
+		t.Fatal("child store did not expose its actual namespace")
+	}
+	if boundarySchemaExists(t, admin, ownedSchema) {
+		t.Errorf("store cleanup left its namespace %q behind", ownedSchema)
+	}
+	for _, schema := range []string{baseSchema, neighborSchema, survivorSchema} {
+		if !boundarySchemaExists(t, admin, schema) {
+			t.Errorf("store cleanup deleted another fixture's namespace %q", schema)
+		}
+	}
+	if got := boundarySentinelSnapshot(t, admin, survivorSchema, "survivor-store"); got != survivorBefore {
+		t.Errorf("child store lifetime changed survivor facts: got %s, want %s", got, survivorBefore)
+	}
+	if got := boundarySentinelSnapshot(t, admin, neighborSchema, "fixture-sentinel"); got != neighborBefore {
+		t.Errorf("child store lifetime changed adjacent sentinel: got %s, want %s", got, neighborBefore)
+	}
+}
+
+// All namespaces in these regression tests belong to this test invocation in a
+// Root-provided temporary database. Even the buggy helper only sees that owned
+// base namespace; no RED path points at an application schema.
+func prepareStoreBoundaryFixture(t *testing.T) (*pgxpool.Pool, string, string) {
+	t.Helper()
+	rawURL := os.Getenv("SCHEDULER_DATABASE_TEST_URL")
+	if rawURL == "" {
+		t.Skip("SCHEDULER_DATABASE_TEST_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	admin, err := pgxpool.New(ctx, rawURL)
+	if err != nil {
+		t.Fatal("open boundary fixture pool failed")
+	}
+	t.Cleanup(admin.Close)
+	var databaseName string
+	if err := admin.QueryRow(ctx, "SELECT current_database()").Scan(&databaseName); err != nil {
+		t.Fatal("inspect boundary fixture database failed")
+	}
+	if !strings.HasPrefix(databaseName, "kokoro_scheduler_test") {
+		t.Fatal("boundary fixture requires a Root-owned kokoro_scheduler_test temporary database")
+	}
+	suffix := strings.ToLower(rand.Text())
+	baseSchema := "scheduler_boundary_base_" + suffix
+	neighborSchema := "scheduler_boundary_neighbor_" + suffix
+	for _, schemaName := range []string{baseSchema, neighborSchema} {
+		identifier := pgx.Identifier{schemaName}.Sanitize()
+		if _, err := admin.Exec(ctx, "CREATE SCHEMA "+identifier); err != nil {
+			t.Fatalf("create owned boundary namespace %q: %v", schemaName, err)
+		}
+		t.Cleanup(func() {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cleanupCancel()
+			if _, err := admin.Exec(cleanupCtx, "DROP SCHEMA "+identifier+" CASCADE"); err != nil {
+				t.Errorf("clean owned boundary namespace %q: %v", schemaName, err)
+			}
+		})
+		poolConfig, err := pgxpool.ParseConfig(rawURL)
+		if err != nil {
+			t.Fatal("parse boundary fixture connection failed")
+		}
+		poolConfig.ConnConfig.RuntimeParams["search_path"] = schemaName
+		pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+		if err != nil {
+			t.Fatal("open owned boundary namespace pool failed")
+		}
+		t.Cleanup(pool.Close)
+		if err := postgresadapter.ApplySchemaToEmptyDatabase(ctx, pool); err != nil {
+			t.Fatalf("install owned boundary namespace %q: %v", schemaName, err)
+		}
+		seedBoundarySentinel(t, pool, "fixture-sentinel")
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatal("parse boundary fixture URL failed")
+	}
+	query := parsed.Query()
+	query.Set("search_path", baseSchema)
+	parsed.RawQuery = query.Encode()
+	t.Setenv("SCHEDULER_DATABASE_TEST_URL", parsed.String())
+	return admin, baseSchema, neighborSchema
+}
+
+func seedBoundarySentinel(t *testing.T, pool *pgxpool.Pool, name string) {
+	t.Helper()
+	clock := doubles.NewClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	service, err := application.NewService(postgresadapter.NewStore(pool), clock, recurrence.NewCalculator())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	receipt, err := service.Execute(ctx, createCommand("boundary-tenant", name, "key-"+name, "request-"+name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Result.Code != domain.ResultRegistered || receipt.Result.Schedule == nil {
+		t.Fatalf("sentinel seed = %#v, want a registered schedule", receipt.Result)
+	}
+}
+
+func integrationStoreSchema(t *testing.T, pool *pgxpool.Pool) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var schemaName string
+	if err := pool.QueryRow(ctx, "SELECT current_schema()").Scan(&schemaName); err != nil {
+		t.Fatal(err)
+	}
+	return schemaName
+}
+
+func boundarySentinelSnapshot(t *testing.T, pool *pgxpool.Pool, schemaName, name string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	query := fmt.Sprintf(`SELECT jsonb_build_object(
+		'schedule', (SELECT to_jsonb(s) FROM %s s WHERE tenant_id = $1 AND name = $2),
+		'receipt', (SELECT to_jsonb(r) FROM %s r WHERE tenant_id = $1 AND idempotency_key = $3)
+	)::text`, pgx.Identifier{schemaName, "scheduler_schedule"}.Sanitize(), pgx.Identifier{schemaName, "scheduler_command_receipt"}.Sanitize())
+	var snapshot string
+	if err := pool.QueryRow(ctx, query, "boundary-tenant", name, "key-"+name).Scan(&snapshot); err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
+}
+
+func boundarySchemaExists(t *testing.T, pool *pgxpool.Pool, schemaName string) bool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var exists bool
+	if err := pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = $1)", schemaName).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	return exists
 }
 
 func TestPostgresCommandReceiptSurvivesServiceReconstructionAndIsolatesTenants(t *testing.T) {
@@ -551,30 +739,55 @@ func openIntegrationStore(t *testing.T) (*postgresadapter.Store, *pgxpool.Pool) 
 	if rawURL == "" {
 		t.Skip("SCHEDULER_DATABASE_TEST_URL is not configured")
 	}
-	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, rawURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	admin, err := pgxpool.New(ctx, rawURL)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("open integration fixture administration pool failed")
 	}
-	t.Cleanup(pool.Close)
+	schemaName := "scheduler_integration_" + strings.ToLower(rand.Text())
+	identifier := pgx.Identifier{schemaName}.Sanitize()
+	schemaCreated := false
+	var pool *pgxpool.Pool
+	t.Cleanup(func() {
+		defer admin.Close()
+		if pool != nil {
+			pool.Close()
+		}
+		if !schemaCreated {
+			return
+		}
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		if _, err := admin.Exec(cleanupCtx, "DROP SCHEMA "+identifier+" CASCADE"); err != nil {
+			t.Errorf("clean owned integration namespace %q: %v", schemaName, err)
+		}
+	})
 	var databaseName string
-	if err := pool.QueryRow(ctx, "SELECT current_database()").Scan(&databaseName); err != nil {
-		t.Fatal(err)
+	if err := admin.QueryRow(ctx, "SELECT current_database()").Scan(&databaseName); err != nil {
+		t.Fatal("inspect integration fixture database failed")
 	}
 	if len(databaseName) < len("kokoro_scheduler_test") || databaseName[:len("kokoro_scheduler_test")] != "kokoro_scheduler_test" {
 		t.Fatalf("integration database %q must use the kokoro_scheduler_test prefix", databaseName)
 	}
-	_, file, _, _ := runtime.Caller(0)
-	schemaPath := filepath.Clean(filepath.Join(filepath.Dir(file), "../..", "database", "schema.sql"))
-	schema, err := os.ReadFile(schemaPath)
+	// The database name admits a test target; it never grants ownership of its
+	// existing tables. Only the namespace created below belongs to this store.
+	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+identifier); err != nil {
+		t.Fatalf("create owned integration namespace %q: %v", schemaName, err)
+	}
+	schemaCreated = true
+	poolConfig, err := pgxpool.ParseConfig(rawURL)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("parse integration fixture connection failed")
 	}
-	if _, err := pool.Exec(ctx, string(schema)); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	poolConfig.ConnConfig.RuntimeParams["search_path"] = schemaName
+	poolConfig.ConnConfig.RuntimeParams["timezone"] = "UTC"
+	pool, err = pgxpool.NewWithConfig(ctx, poolConfig)
+	if err != nil {
+		t.Fatal("open owned integration namespace pool failed")
 	}
-	if _, err := pool.Exec(ctx, `TRUNCATE scheduler_dispatch_outbox, scheduler_occurrence, scheduler_command_receipt, scheduler_schedule`); err != nil {
-		t.Fatal(err)
+	if err := postgresadapter.ApplySchemaToEmptyDatabase(ctx, pool); err != nil {
+		t.Fatalf("install owned integration namespace %q: %v", schemaName, err)
 	}
 	return postgresadapter.NewStore(pool), pool
 }
