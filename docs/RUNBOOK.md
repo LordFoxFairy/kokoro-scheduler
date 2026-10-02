@@ -2,19 +2,19 @@
 
 ## 1. 启动前
 
-1. 准备 Scheduler 专用 PostgreSQL database；不要指向其他 owner 或共享业务 database；
+1. 复用单应用 PostgreSQL database 与现有应用 role/credential，为 Scheduler 显式选择独立 owner schema；不访问其他 owner 事实，不新增运维角色或提权；
 2. 对全新空 namespace 运行一次 `./scripts/db-apply-schema`；
 3. 注入 inbound service token、可选独立 outbound token；
 4. 如启用 Redis，复用实例但 URL 必须显式 logical DB 7；
 5. 校验 target allowlist、egress policy 和目标端 durable idempotency receipt；
 6. 确认 `claim_ttl > dispatch_timeout`。
 
-`db:apply-schema` 不是 upgrade/migration runner；发现任意现有 table 会退出。不要为绕过检查删除或清空未知表。
+`db:apply-schema` 不是 upgrade/migration runner；只拒绝显式目标 namespace 非空，包括 table、view、sequence、type、function 等 schema-bound 用户对象，同库邻居非空不构成拒绝理由。不要为绕过检查删除或清空未知对象。
 
 ## 2. 本地启动
 
 ```bash
-export SCHEDULER_DATABASE_URL='postgresql://USER:PASSWORD@HOST:PORT/kokoro_scheduler'
+export SCHEDULER_DATABASE_URL='postgresql://USER:PASSWORD@HOST:PORT/APP_DATABASE?schema=kokoro_scheduler'
 export SCHEDULER_INTERNAL_SERVICE_TOKEN='TOKEN'
 # optional:
 # export SCHEDULER_TARGET_SERVICE_TOKEN='TOKEN'
@@ -29,13 +29,13 @@ curl -fsS http://127.0.0.1:8080/healthz
 curl -fsS http://127.0.0.1:8080/readyz
 ```
 
-ready 200 代表 Runtime accepting、PostgreSQL ping成功，以及已配置 Redis 的 PING 成功；不证明 target业务健康。
+ready 200 代表 Runtime accepting、同一 PostgreSQL session 中显式目标 namespace 存在、唯一 owner search_path/UTC 与四张事实表通过检查，以及已配置 Redis 的 PING 成功；不是仅连接 ping，不证明完整 catalog drift 正确或 target 业务健康。
 
 ## 3. 配置速查
 
 | 变量 | 默认/要求 | 失败行为 |
 |---|---|---|
-| `SCHEDULER_DATABASE_URL` | 必填，绝对 postgres/postgresql URL | startup退出 |
+| `SCHEDULER_DATABASE_URL` | 必填，绝对 postgres/postgresql URL＋唯一显式 `schema=kokoro_scheduler`；schema 为首位字母的小写安全 ASCII、≤63 字节、非 public/pg_，拒重复/列表及 options/search_path/timezone 覆盖入口与大小写变体 | parse/owner readiness 失败 startup退出 |
 | `SCHEDULER_REDIS_URL` | 可选，必须 `/7` | parse/PING失败 startup退出；运行期 defer |
 | `SCHEDULER_HTTP_ADDR` | `:8080` | bind失败 shutdown |
 | `SCHEDULER_INTERNAL_SERVICE_TOKEN` | command route所需 | 空值 command 401，probe可用 |
@@ -69,19 +69,19 @@ ORDER BY created_at DESC, id DESC
 LIMIT 100;
 ```
 
-这些查询只用于 Scheduler 自有 database。日志中按 `request_id`/`trace_id` 关联，不粘贴 token、payload、完整 credential URL。
+这些查询只用于单应用库中的 Scheduler 自有 schema。正式 `SCHEDULER_DATABASE_URL` 必须含 `schema=kokoro_scheduler`，由 Go 唯一 parser 消费并控制 search_path/UTC；psql/libpq 使用不含自定义 selector 的独立诊断 URL，并在查询前显式 `SET search_path TO kokoro_scheduler; SET TIME ZONE 'UTC';`，不直接传正式 URL 给 psql、不复制 parser。日志按 `request_id`/`trace_id` 关联，不粘贴 token、payload、完整 credential URL。
 
 ## 5. 常见故障
 
-### `db:apply-schema` 拒绝非空 database
+### `db:apply-schema` 拒绝非空 owner schema
 
-确认 URL/database/search_path。若属于已有 Scheduler deployment，停止并按版本化部署决策处理；current schema流程没有 in-place migration。若属于错误 database，修正 URL。不要 drop/truncate 非本任务资源。
+确认正式 URL 的 database 与唯一显式 `schema=kokoro_scheduler`；安装只判断该目标 schema 的用户对象，同库邻居已有数据不应导致拒绝。已有 Scheduler deployment 不重复安装，按版本化部署决策处理；current schema 流程没有 in-place migration。错误目标应修正 URL/selector，不通过修改 search_path 绕开唯一 parser；不要 drop/truncate 非本任务资源。
 
 ### ready 503
 
 1. 查 startup/background log；
-2. 用受限 credential `SELECT 1` 检查 PostgreSQL；
-3. 确认四张 table 已存在且 search_path正确；
+2. 用受限 credential 和不含自定义 selector 的独立诊断 URL 检查 PostgreSQL 连通性；仅 `SELECT 1` 不证明 owner ready；
+3. 显式核对 `kokoro_scheduler` namespace 与其中四张事实表；正式 Go 入口检查同 session 的唯一目标 search_path/UTC，不借 public/邻居表，也不把轻量 ready 当完整 catalog drift 门；
 4. 配置 Redis 时只 PING DB 7 并检查网络/ACL/TLS；
 5. 修复依赖后 readiness自动恢复，不手工改业务状态。
 

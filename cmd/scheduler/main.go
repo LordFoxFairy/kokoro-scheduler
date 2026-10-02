@@ -81,12 +81,12 @@ func run(logger *slog.Logger) error {
 	}
 	startupCtx, startupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer startupCancel()
-	pool, err := pgxpool.New(startupCtx, cfg.DatabaseURL)
+	pool, err := pgxpool.New(startupCtx, cfg.Database.DriverURL())
 	if err != nil {
-		return fmt.Errorf("open scheduler PostgreSQL store: %w", err)
+		return errors.New("open scheduler PostgreSQL store failed")
 	}
 	defer pool.Close()
-	store := postgresadapter.NewStore(pool)
+	store := postgresadapter.NewStore(pool, cfg.Database)
 	if err := store.Ping(startupCtx); err != nil {
 		return fmt.Errorf("ping scheduler PostgreSQL store: %w", err)
 	}

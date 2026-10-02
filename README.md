@@ -40,14 +40,14 @@ test/{architecture,contract,schema,integration,smoke,doubles}/
 
 ## 五分钟启动
 
-要求：`go 1.26.8`、一个**空的 Scheduler 专用 PostgreSQL database**。本地多实例联调可复用共享 Redis logical DB 7；不要清理其他 logical DB。
+要求：`go 1.26.8`、现有应用 PostgreSQL database 中一个**空或尚不存在的 Scheduler owner schema**（同库其他 owner 可已有数据）。本地多实例联调可复用共享 Redis logical DB 7；不要清理其他 logical DB。
 
 ```bash
 git clone https://github.com/LordFoxFairy/kokoro-scheduler.git
 cd kokoro-scheduler
 go mod download
 
-export SCHEDULER_DATABASE_URL='postgresql://USER:PASSWORD@HOST:PORT/EMPTY_SCHEDULER_DATABASE'
+export SCHEDULER_DATABASE_URL='postgresql://USER:PASSWORD@HOST:PORT/APP_DATABASE?schema=kokoro_scheduler'
 export SCHEDULER_INTERNAL_SERVICE_TOKEN='TOKEN'
 # 可选，且 URL 必须显式选择 /7：
 # export SCHEDULER_REDIS_URL='redis://HOST:PORT/7'
@@ -102,7 +102,7 @@ DOM 与 DOW 都受限时使用标准 OR 语义；任一字段为无 step 的 `*`
 
 | 变量 | 必需 | 默认/约束 |
 |---|---:|---|
-| `SCHEDULER_DATABASE_URL` | 是 | Scheduler 专用 PostgreSQL database |
+| `SCHEDULER_DATABASE_URL` | 是 | PostgreSQL URL + 唯一显式 `schema=kokoro_scheduler`；不可使用 public/pg_ namespace |
 | `SCHEDULER_REDIS_URL` | 否 | 配置时必须为 `redis://.../7` 或 `rediss://.../7` |
 | `SCHEDULER_HTTP_ADDR` | 否 | `:8080` |
 | `SCHEDULER_INTERNAL_SERVICE_TOKEN` | command 使用时是 | 空值使 command fail closed，探针仍可用 |
@@ -116,7 +116,7 @@ DOM 与 DOW 都受限时使用标准 OR 语义；任一字段为无 step 的 `*`
 
 ## 验证
 
-真实 integration/smoke 使用独立测试 database；无 URL 时相关测试明确 SKIP。
+真实 integration/smoke 使用 Root 自有临时测试 database 的 base URL，fixture 为每个 store 创建独占随机 schema；子进程使用当次显式 selector。无 URL 时相关测试明确 SKIP。
 
 ```bash
 gofmt -w .
@@ -134,4 +134,6 @@ env \
 git diff --check
 ```
 
-`./scripts/db-apply-schema` 只接受空 database namespace，只安装 [`database/schema.sql`](./database/schema.sql)，不是历史升级工具。
+`./scripts/db-apply-schema` 只接受显式目标 owner namespace 为空（含 view/type/function 等对象），缺失时同事务创建目标；同库邻居不参与判断，只安装 [`database/schema.sql`](./database/schema.sql)，不是历史升级工具。
+
+数据库 URL 在 raw Unicode 控制字符检查后才 trim/解析。`schema` 必须是恰一小写安全 ASCII 标识符（首位字母，最多 63 字节）；拒重复、列表和 options/search_path/timezone 等覆盖键及大小写变体。唯一 parser 消费 selector，生成 owner-only search_path 与 UTC，并保留普通 TLS 参数；安装入口不加载 Redis/runtime 配置。启动和 `/readyz` 在同 session 检查目标 namespace、UTC 和四事实表，不自动建表或借邻居。完整 catalog、并发/回滚与真实资源验收仍待 Root 后继门；轻量 ready 不证明 drift 正确，当前不发布半 cutover。

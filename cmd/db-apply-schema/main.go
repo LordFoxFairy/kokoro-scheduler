@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	postgresadapter "github.com/LordFoxFairy/kokoro-scheduler/internal/adapters/postgres"
@@ -20,21 +20,21 @@ func main() {
 }
 
 func run() error {
-	databaseURL := strings.TrimSpace(os.Getenv(config.DatabaseURLEnv))
-	if databaseURL == "" {
-		return fmt.Errorf("db:apply-schema requires %s", config.DatabaseURLEnv)
+	target, err := config.ParseDatabaseURL(os.Getenv(config.DatabaseURLEnv))
+	if err != nil {
+		return fmt.Errorf("load %s: %w", config.DatabaseURLEnv, err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	pool, err := pgxpool.New(ctx, databaseURL)
+	pool, err := pgxpool.New(ctx, target.DriverURL())
 	if err != nil {
-		return fmt.Errorf("open PostgreSQL target: %w", err)
+		return errors.New("open PostgreSQL target failed")
 	}
 	defer pool.Close()
 	if err := pool.Ping(ctx); err != nil {
-		return fmt.Errorf("ping PostgreSQL target: %w", err)
+		return errors.New("ping PostgreSQL target failed")
 	}
-	if err := postgresadapter.ApplySchemaToEmptyDatabase(ctx, pool); err != nil {
+	if err := postgresadapter.ApplySchemaToEmptyDatabase(ctx, pool, target); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintln(os.Stdout, "db:apply-schema installed database/schema.sql")

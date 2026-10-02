@@ -40,21 +40,22 @@ test ! -d database/migrations
 
 Contract gate 必须验证 OpenAPI parse/$ref、五个 governance extension、protected v1 signature、Schedule/Occurrence/dispatch schema、所有 control route runtime parity、concrete dispatch header parity 与 manifest SHA-256。
 
-## 3. Fresh database schema
+## 3. Fresh owner schema
 
-创建独立临时 database，不对共享业务库执行：
+应用使用单一 database、各 owner 独立 schema。此验收只在本次自有临时测试库验证目标 schema 安装，不要求同库邻居为空，不对共享业务库清理：
 
 ```bash
 createdb 'kokoro_scheduler_test_SCHEMA_RUN'
-export SCHEDULER_DATABASE_URL='postgresql://USER:PASSWORD@HOST:PORT/kokoro_scheduler_test_SCHEMA_RUN'
+export SCHEDULER_DATABASE_URL='postgresql://USER:PASSWORD@HOST:PORT/kokoro_scheduler_test_SCHEMA_RUN?schema=kokoro_scheduler'
 ./scripts/db-apply-schema
-psql "$SCHEDULER_DATABASE_URL" -Atc \
-  "select count(*) from pg_catalog.pg_tables where schemaname=current_schema() and tablename like 'scheduler_%'"
+# psql/libpq 不消费应用自定义 schema selector；诊断 URL 与 runtime 配置分离。
+psql 'postgresql://USER:PASSWORD@HOST:PORT/kokoro_scheduler_test_SCHEMA_RUN' -Atc \
+  "select count(*) from pg_catalog.pg_tables where schemaname='kokoro_scheduler' and tablename like 'scheduler_%'"
 # 期望 4；验收结束后：
 dropdb 'kokoro_scheduler_test_SCHEMA_RUN'
 ```
 
-同一 database 第二次执行 `./scripts/db-apply-schema` 必须以“requires an empty database schema”失败。
+相同显式 owner schema 第二次执行 `./scripts/db-apply-schema` 必须以“requires an empty database schema”失败；同库其他 namespace 非空不构成拒绝理由。Root 当前已在自有临时库验证现15个 PG integration 与1个 source binary restart 通过（日志 `/tmp/kokoro-scheduler-schema-r41-root-resource-green.log`、`/tmp/kokoro-scheduler-schema-r41-root-source-smoke.log`），不代表完整 catalog、并发/回滚扩展或全组合验收。
 
 ## 4. Real PostgreSQL/Redis/integration/smoke
 

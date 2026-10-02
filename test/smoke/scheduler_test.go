@@ -17,6 +17,7 @@ import (
 	"time"
 
 	postgresadapter "github.com/LordFoxFairy/kokoro-scheduler/internal/adapters/postgres"
+	"github.com/LordFoxFairy/kokoro-scheduler/internal/config"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -181,26 +182,30 @@ func schedulerEnvironment(databaseURL, address string) []string {
 func isolatedDatabaseSchema(t *testing.T, rawURL string) (string, *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
-	admin, err := pgxpool.New(ctx, rawURL)
+	schemaName := fmt.Sprintf("scheduler_smoke_%d", time.Now().UnixNano())
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatal("parse smoke fixture base URL failed")
+	}
+	query := parsed.Query()
+	query.Set("schema", schemaName)
+	parsed.RawQuery = query.Encode()
+	isolatedURL := parsed.String()
+	target, err := config.ParseDatabaseURL(isolatedURL)
+	if err != nil {
+		t.Fatal("parse explicit smoke database target failed")
+	}
+	admin, err := pgxpool.New(ctx, target.DriverURL())
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(admin.Close)
-	schemaName := fmt.Sprintf("scheduler_smoke_%d", time.Now().UnixNano())
 	identifier := pgx.Identifier{schemaName}.Sanitize()
 	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+identifier); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _, _ = admin.Exec(context.Background(), "DROP SCHEMA "+identifier+" CASCADE") })
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	query := parsed.Query()
-	query.Set("search_path", schemaName)
-	parsed.RawQuery = query.Encode()
-	isolatedURL := parsed.String()
-	poolConfig, err := pgxpool.ParseConfig(isolatedURL)
+	poolConfig, err := pgxpool.ParseConfig(target.DriverURL())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +214,7 @@ func isolatedDatabaseSchema(t *testing.T, rawURL string) (string, *pgxpool.Pool)
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	if err := postgresadapter.ApplySchemaToEmptyDatabase(ctx, pool); err != nil {
+	if err := postgresadapter.ApplySchemaToEmptyDatabase(ctx, pool, target); err != nil {
 		t.Fatal(err)
 	}
 	return isolatedURL, pool

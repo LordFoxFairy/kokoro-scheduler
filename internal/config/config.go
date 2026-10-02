@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const (
@@ -32,7 +33,7 @@ const (
 )
 
 type Config struct {
-	DatabaseURL             string
+	Database                DatabaseTarget
 	RedisURL                string
 	HTTPAddr                string
 	InternalServiceToken    string
@@ -49,8 +50,8 @@ func Load(getenv func(string) string) (Config, error) {
 	if getenv == nil {
 		getenv = os.Getenv
 	}
-	databaseURL := strings.TrimSpace(getenv(DatabaseURLEnv))
-	if err := validatePostgresURL(databaseURL); err != nil {
+	database, err := ParseDatabaseURL(getenv(DatabaseURLEnv))
+	if err != nil {
 		return Config{}, fmt.Errorf("load %s: %w", DatabaseURLEnv, err)
 	}
 	redisURL := strings.TrimSpace(getenv(RedisURLEnv))
@@ -91,7 +92,7 @@ func Load(getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 	return Config{
-		DatabaseURL: databaseURL, RedisURL: redisURL, HTTPAddr: addr,
+		Database: database, RedisURL: redisURL, HTTPAddr: addr,
 		InternalServiceToken:    strings.TrimSpace(getenv(InternalServiceTokenEnv)),
 		TargetServiceToken:      strings.TrimSpace(getenv(TargetServiceTokenEnv)),
 		InternalTargetAllowlist: allowlist,
@@ -100,15 +101,61 @@ func Load(getenv func(string) string) (Config, error) {
 	}, nil
 }
 
-func validatePostgresURL(rawURL string) error {
+// DatabaseTarget is created only by ParseDatabaseURL. Callers cannot mutate its
+// driver URL and namespace independently.
+type DatabaseTarget struct {
+	driverURL  string
+	schemaName string
+}
+
+func (target DatabaseTarget) DriverURL() string  { return target.driverURL }
+func (target DatabaseTarget) SchemaName() string { return target.schemaName }
+
+func ParseDatabaseURL(rawURL string) (DatabaseTarget, error) {
+	if strings.IndexFunc(rawURL, unicode.IsControl) >= 0 {
+		return DatabaseTarget{}, errors.New("database URL must not contain raw control characters")
+	}
+	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
-		return errors.New("value is required")
+		return DatabaseTarget{}, errors.New("value is required")
 	}
 	parsed, err := url.Parse(rawURL)
-	if err != nil || (parsed.Scheme != "postgres" && parsed.Scheme != "postgresql") || parsed.Host == "" || strings.Trim(parsed.Path, "/") == "" {
-		return errors.New("value must be an absolute postgres or postgresql database URL")
+	if err != nil || (parsed.Scheme != "postgres" && parsed.Scheme != "postgresql") || parsed.Host == "" || strings.Trim(parsed.Path, "/") == "" || strings.Contains(rawURL, "#") {
+		return DatabaseTarget{}, errors.New("value must be an absolute postgres or postgresql database URL without a fragment")
 	}
-	return nil
+	query, err := url.ParseQuery(parsed.RawQuery)
+	if err != nil {
+		return DatabaseTarget{}, errors.New("database URL query must use valid encoding")
+	}
+	for key := range query {
+		switch strings.ToLower(key) {
+		case "schema":
+			if key != "schema" {
+				return DatabaseTarget{}, errors.New("database URL must use the exact schema selector key")
+			}
+		case "options", "search_path", "timezone":
+			return DatabaseTarget{}, errors.New("database URL must not override namespace or timezone")
+		}
+	}
+	schemas := query["schema"]
+	if len(schemas) != 1 || len(schemas[0]) == 0 || len(schemas[0]) > 63 {
+		return DatabaseTarget{}, errors.New("database URL requires exactly one nonempty schema selector of at most 63 ASCII bytes")
+	}
+	schemaName := schemas[0]
+	for index, character := range []byte(schemaName) {
+		if (character >= 'a' && character <= 'z') || (index > 0 && ((character >= '0' && character <= '9') || character == '_')) {
+			continue
+		}
+		return DatabaseTarget{}, errors.New("database schema must be a lowercase ASCII identifier starting with a letter")
+	}
+	if schemaName == "public" || strings.HasPrefix(schemaName, "pg_") {
+		return DatabaseTarget{}, errors.New("database schema must be an explicit nonreserved owner namespace")
+	}
+	query.Del("schema")
+	query.Set("search_path", schemaName)
+	query.Set("timezone", "UTC")
+	parsed.RawQuery = query.Encode()
+	return DatabaseTarget{driverURL: parsed.String(), schemaName: schemaName}, nil
 }
 
 func validateRedisDBSeven(rawURL string) error {

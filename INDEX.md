@@ -28,18 +28,18 @@
 | 路径 | Owner / 内容 | 依赖边界 |
 |---|---|---|
 | `cmd/scheduler/` | 生产组合根、探针、signal 与 graceful shutdown | 装配全部 concrete adapter |
-| `cmd/db-apply-schema/` | 仅向空 database namespace 安装 canonical schema | PostgreSQL + embedded schema |
+| `cmd/db-apply-schema/` | 仅向显式空 owner namespace 安装 canonical schema | PostgreSQL + embedded schema |
 | `database/` | 当前 schema 及其 Go embed | 不保存 migration |
 | `internal/domain/` | Schedule、Occurrence、Receipt、Dispatch 状态与纯规则 | 仅 Go 标准库 |
 | `internal/application/` | command 事务、due planning、misfire、overlap、retry、recovery | `domain`、`ports` |
 | `internal/ports/` | Store/TxStore、Clock、Recurrence、Wakeup、Lease、Target | 技术中立 |
-| `internal/adapters/postgres/` | repository、事务 claim、outbox 与 schema bootstrap | pgx |
+| `internal/adapters/postgres/` | repository、事务 claim、outbox、显式目标 bootstrap 与同 session readiness | pgx |
 | `internal/adapters/recurrence/` | 五字段 cron/`@every` 与 IANA timezone 计算 | Go time/tzdata |
 | `internal/adapters/gocron/` | 固定周期进程内唤醒；不保存业务事实 | gocron/v2 |
 | `internal/adapters/httpclient/` | 目标 dispatch、timeout、DNS pin 与错误分类 | net/http |
 | `internal/adapters/redis/` | 可选 DB 7 token-fenced lease | go-redis |
 | `internal/transport/http/` | 受信 internal control API 与响应映射 | application |
-| `internal/config/` | 环境配置和边界校验 | domain 配置规则 |
+| `internal/config/` | 环境配置、唯一纯 DatabaseTarget parser 和边界校验 | domain 配置规则 |
 | `test/` | architecture、schema、contract、integration、smoke、doubles | 仅测试使用 |
 
 依赖方向：

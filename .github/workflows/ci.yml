@@ -34,7 +34,7 @@ jobs:
           --health-timeout 3s
           --health-retries 5
     env:
-      SCHEDULER_DATABASE_URL: postgresql://kokoro:kokoro@127.0.0.1:5432/kokoro_scheduler_test_ci
+      SCHEDULER_DATABASE_URL: postgresql://kokoro:kokoro@127.0.0.1:5432/kokoro_scheduler_test_ci?schema=kokoro_scheduler
       SCHEDULER_DATABASE_TEST_URL: postgresql://kokoro:kokoro@127.0.0.1:5432/kokoro_scheduler_test_ci
       SCHEDULER_REDIS_TEST_URL: redis://127.0.0.1:6379/7
     steps:
