@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"regexp"
 	"strings"
@@ -216,3 +217,122 @@ func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) 
 type failingReader struct{}
 
 func (failingReader) Read([]byte) (int, error) { return 0, errors.New("read failed") }
+
+func TestClientPreservesDispatchSnapshotAcrossReconstructionAfterUnknownResponse(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		dropFirst bool
+	}{
+		{"accepted control", false},
+		{"received then disconnected", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			type receivedRequest struct {
+				attempt int
+				method  string
+				path    string
+				headers http.Header
+				body    string
+			}
+			received := make(chan receivedRequest, 4)
+			count := make(chan int, 1)
+			count <- 0
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				attempt := <-count + 1
+				count <- attempt
+				body, err := io.ReadAll(request.Body)
+				if err != nil {
+					t.Errorf("server reading attempt %d: %v", attempt, err)
+					http.Error(writer, "read failed", http.StatusBadRequest)
+					return
+				}
+				received <- receivedRequest{attempt, request.Method, request.URL.Path, request.Header.Clone(), string(body)}
+				if test.dropFirst && attempt == 1 {
+					connection, _, err := writer.(http.Hijacker).Hijack()
+					if err != nil {
+						t.Errorf("server hijacking first received request: %v", err)
+						return
+					}
+					if err := connection.Close(); err != nil {
+						t.Errorf("server closing first connection: %v", err)
+					}
+					return
+				}
+				writer.WriteHeader(http.StatusAccepted)
+			}))
+			defer server.Close()
+
+			newClient := func() *Client {
+				transport := &http.Transport{DisableKeepAlives: true}
+				t.Cleanup(transport.CloseIdleConnections)
+				return NewClientWithResolver(&http.Client{Transport: transport, Timeout: 2 * time.Second}, "loopback-fixture-token", nil, AddressAllowlistFunc(func(host string, address netip.Addr) bool {
+					return host == "127.0.0.1" && address == netip.MustParseAddr("127.0.0.1")
+				}))
+			}
+			work := testWork()
+			work.TargetURL = server.URL + "/command"
+			work.Payload = []byte("{ \"tenant_id\": \"tenant-a\", \"command\": \"nightly\", \"data\": [1, true] }\n")
+			work.AttemptCount = 1
+			work.Status = domain.OutboxDispatching
+			identity := domain.OccurrenceIdentity(work.ScheduleSnapshot(), work.ScheduledAt)
+			firstClient := newClient()
+			first := firstClient.Dispatch(context.Background(), work)
+			if test.dropFirst {
+				if first.Status != 0 || first.Code != domain.CodeTargetUnavailable || !errors.Is(first.Err, io.EOF) || !domain.RetryableDispatch(first) {
+					t.Fatalf("first response after actual server receive and disconnect = %#v, want retryable unknown EOF", first)
+				}
+			} else if !first.Succeeded() || first.Status != http.StatusAccepted {
+				t.Fatalf("accepted control = %#v", first)
+			}
+			if first.RequestID != identity.RequestID || first.IdempotencyKey != identity.IdempotencyKey || first.TraceID != identity.TraceID {
+				t.Fatalf("first result changed snapshot identity: %#v", first)
+			}
+
+			wantRequests := 1
+			if test.dropFirst {
+				reconstructed := work
+				reconstructed.Payload = append([]byte(nil), work.Payload...)
+				reconstructed.ScheduledAt = work.ScheduledAt.UTC()
+				reconstructed.AttemptCount = 2
+				reconstructed.NextAttemptAt = work.ScheduledAt.Add(time.Second)
+				secondClient := newClient()
+				if secondClient == firstClient || secondClient.httpClient == firstClient.httpClient {
+					t.Fatal("retry must reconstruct both Scheduler Client and underlying HTTP client")
+				}
+				second := secondClient.Dispatch(context.Background(), reconstructed)
+				if !second.Succeeded() || second.Status != http.StatusAccepted || domain.RetryableDispatch(second) {
+					t.Fatalf("second response = %#v, want successful HTTP 202", second)
+				}
+				if second.RequestID != first.RequestID || second.IdempotencyKey != first.IdempotencyKey || second.TraceID != first.TraceID {
+					t.Fatalf("reconstructed client changed identity: first=%#v second=%#v", first, second)
+				}
+				wantRequests = 2
+			}
+			server.Close()
+			if got := <-count; got != wantRequests || len(received) != wantRequests {
+				t.Fatalf("actual server receives = %d, captured = %d, want exactly %d", got, len(received), wantRequests)
+			}
+			for attempt := 1; attempt <= wantRequests; attempt++ {
+				got := <-received
+				if got.attempt != attempt || got.method != http.MethodPost || got.path != "/command" || got.body != string(work.Payload) {
+					t.Fatalf("received attempt %d changed method/path/payload bytes: %#v", attempt, got)
+				}
+				for header, want := range map[string]string{
+					RequestIDHeader:   identity.RequestID,
+					IdempotencyHeader: identity.IdempotencyKey,
+					OccurrenceHeader:  "2026-01-02T08:04:05.123Z",
+					TenantHeader:      "tenant-a",
+					ScheduleHeader:    "billing.reconcile",
+					"Content-Type":    "application/json",
+					"Authorization":   "Bearer loopback-fixture-token",
+					"traceparent":     traceparent(identity.TraceID, identity.RequestID),
+				} {
+					if value := got.headers.Get(header); value != want {
+						t.Errorf("attempt %d header %s = %q, want %q", attempt, header, value, want)
+					}
+				}
+			}
+			t.Logf("actual loopback receives=%d; owned server closed; no durable receipt or business-effect assertion", wantRequests)
+		})
+	}
+}

@@ -94,3 +94,53 @@ func TestDispatchResultClassifiesTransientAndPermanentFailures(t *testing.T) {
 		}
 	}
 }
+
+func TestOccurrenceIdentityPreservesNormalizedInstantAndSeparatesSnapshotDimensions(t *testing.T) {
+	at := time.Date(2026, 1, 2, 8, 4, 5, 123_450_000, time.UTC)
+	normalized := time.Date(2026, 1, 2, 8, 4, 5, 123_000_000, time.UTC)
+	schedule := Schedule{ID: "00000000-0000-0000-0000-000000000001", TenantID: "tenant-a", Name: "nightly"}
+	tenant := schedule
+	tenant.TenantID = "tenant-b"
+	id := schedule
+	id.ID = "00000000-0000-0000-0000-000000000002"
+	name := schedule
+	name.Name = "nightly-renamed"
+	baseline := OccurrenceIdentity(schedule, at)
+
+	for _, test := range []struct {
+		name       string
+		schedule   Schedule
+		at         time.Time
+		normalized time.Time
+		same       bool
+	}{
+		{"reconstructed snapshot", schedule, at, normalized, true},
+		{"same instant west timezone", schedule, at.In(time.FixedZone("west", -5*60*60)), normalized, true},
+		{"same instant east timezone", schedule, at.In(time.FixedZone("east", 9*60*60)), normalized, true},
+		{"same millisecond lower precision", schedule, normalized.Add(time.Nanosecond), normalized, true},
+		{"same millisecond upper precision", schedule, normalized.Add(time.Millisecond - time.Nanosecond), normalized, true},
+		{"different tenant", tenant, at, normalized, false},
+		{"different schedule ID", id, at, normalized, false},
+		{"different schedule name", name, at, normalized, false},
+		{"next millisecond", schedule, at.Add(time.Millisecond), normalized.Add(time.Millisecond), false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := OccurrenceIdentity(test.schedule, test.at)
+			if !got.ScheduledAt.Equal(test.normalized) || got.ScheduledAt.Location() != time.UTC || got.ScheduledAt.Nanosecond()%int(time.Millisecond) != 0 {
+				t.Fatalf("scheduled instant = %v, want UTC %v at millisecond precision", got.ScheduledAt, test.normalized)
+			}
+			if got.RequestID == "" || got.IdempotencyKey == "" || got.TraceID == "" {
+				t.Fatalf("empty occurrence identity: %#v", got)
+			}
+			if same := got.RequestID == baseline.RequestID; same != test.same {
+				t.Errorf("request ID equal to baseline = %v, want %v", same, test.same)
+			}
+			if same := got.IdempotencyKey == baseline.IdempotencyKey; same != test.same {
+				t.Errorf("idempotency key equal to baseline = %v, want %v", same, test.same)
+			}
+			if same := got.TraceID == baseline.TraceID; same != test.same {
+				t.Errorf("trace ID equal to baseline = %v, want %v", same, test.same)
+			}
+		})
+	}
+}
