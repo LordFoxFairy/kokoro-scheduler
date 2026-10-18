@@ -28,7 +28,7 @@ func TestCanonicalOpenAPIHasNoDuplicateObjectKeys(t *testing.T) {
 
 func TestCanonicalOpenAPIIsParseableAndOwnsEveryHTTPRoute(t *testing.T) {
 	document := loadOpenAPI(t)
-	if document.OpenAPI != "3.1.0" || document.Info.Version != "1.0.0" {
+	if document.OpenAPI != "3.1.0" || document.Info.Version != "2.0.0" {
 		t.Fatalf("OpenAPI/version = %q/%q", document.OpenAPI, document.Info.Version)
 	}
 	wantPaths := []string{
@@ -148,6 +148,9 @@ func TestScheduleResponseSchemaMatchesConcreteTransportShape(t *testing.T) {
 	assertFields(t, properties, want, "Schedule")
 	required := scalarStrings(t, schedule["required"])
 	for _, field := range want {
+		if field == "schedule" {
+			continue
+		} // The exclusive trigger branches cover schedule versus run_at.
 		if !contains(required, field) {
 			t.Errorf("Schedule response does not require concrete field %s", field)
 		}
@@ -195,15 +198,15 @@ func TestOccurrenceAndDispatchProtocolAreMachineReadable(t *testing.T) {
 func TestBreakingPolicyProtectsCurrentRequiredSurface(t *testing.T) {
 	document := loadOpenAPI(t)
 	var policy struct {
-		ContractMajor               int                          `json:"contract_major"`
-		RequiredPaths               map[string][]string          `json:"required_paths"`
-		RequiredScheduleInputFields []string                     `json:"required_schedule_input_fields"`
-		RequiredScheduleFields      []string                     `json:"required_schedule_response_fields"`
-		RequiredResolvedRetryFields []string                     `json:"required_resolved_retry_fields"`
-		RequiredOccurrenceFields    []string                     `json:"required_occurrence_fields"`
-		RequiredDispatchHeaders     []string                     `json:"required_dispatch_headers"`
-		RequiredRetryableStatuses   []string                     `json:"required_retryable_statuses"`
-		RequiredControlErrors       map[string]map[string]string `json:"required_control_errors"`
+		ContractMajor               int                            `json:"contract_major"`
+		RequiredPaths               map[string][]string            `json:"required_paths"`
+		RequiredScheduleInputFields []string                       `json:"required_schedule_input_fields"`
+		RequiredScheduleFields      []string                       `json:"required_schedule_response_fields"`
+		RequiredResolvedRetryFields []string                       `json:"required_resolved_retry_fields"`
+		RequiredOccurrenceFields    []string                       `json:"required_occurrence_fields"`
+		RequiredDispatchHeaders     []string                       `json:"required_dispatch_headers"`
+		RequiredRetryableStatuses   []string                       `json:"required_retryable_statuses"`
+		RequiredControlErrors       map[string]map[string][]string `json:"required_control_errors"`
 	}
 	readJSON(t, repositoryPath(t, "contract/openapi/v1/breaking-policy.json"), &policy)
 	if !strings.HasPrefix(document.Info.Version, strconv.Itoa(policy.ContractMajor)+".") {
@@ -245,7 +248,7 @@ func TestBreakingPolicyProtectsCurrentRequiredSurface(t *testing.T) {
 	if len(policy.RequiredControlErrors) == 0 {
 		t.Fatal("breaking policy must protect stable control error codes by operation and HTTP status")
 	}
-	declared := make(map[string]map[string]string)
+	declared := make(map[string]map[string][]string)
 	stableCodes := make(map[string]struct{})
 	for _, item := range document.Paths {
 		for method, raw := range item {
@@ -259,31 +262,36 @@ func TestBreakingPolicyProtectsCurrentRequiredSurface(t *testing.T) {
 				continue
 			}
 			errorsByStatus := object(t, operation, "x-kokoro-control-error-codes")
-			declared[operationID] = make(map[string]string, len(errorsByStatus))
+			declared[operationID] = make(map[string][]string, len(errorsByStatus))
 			responses := object(t, operation, "responses")
-			for status, rawCode := range errorsByStatus {
-				code, ok := rawCode.(string)
-				if !ok || code == "" {
-					t.Fatalf("%s control error %s = %#v, want a stable string code", operationID, status, rawCode)
+			for status, rawCodes := range errorsByStatus {
+				codes := scalarStrings(t, rawCodes)
+				if len(codes) == 0 {
+					t.Fatalf("%s error %s has no codes", operationID, status)
 				}
 				if _, found := responses[status]; !found {
-					t.Errorf("%s maps control error %s to undeclared response status %s", operationID, code, status)
+					t.Errorf("%s maps errors to undeclared %s", operationID, status)
 				}
-				declared[operationID][status] = code
-				stableCodes[code] = struct{}{}
+				declared[operationID][status] = codes
+				for _, code := range codes {
+					if code == "" {
+						t.Fatal("empty stable control code")
+					}
+					stableCodes[code] = struct{}{}
+				}
 			}
 		}
 	}
 	if !reflect.DeepEqual(declared, policy.RequiredControlErrors) {
 		t.Fatalf("OpenAPI control errors %#v do not match breaking policy %#v", declared, policy.RequiredControlErrors)
 	}
-	for _, code := range []string{"schedule_already_exists", "schedule_not_found"} {
+	for _, code := range []string{"schedule_already_exists", "schedule_not_found", "schedule_exhausted", "schedule_changed"} {
 		if _, found := stableCodes[code]; !found {
 			t.Errorf("stable control error set is missing %s", code)
 		}
 	}
-	if len(stableCodes) != 2 {
-		t.Fatalf("stable control error set = %#v, want exactly the two owner control codes", stableCodes)
+	if len(stableCodes) != 4 {
+		t.Fatalf("stable control error set = %#v, want exactly four owner control codes", stableCodes)
 	}
 }
 
@@ -297,7 +305,7 @@ func TestContractProvenanceDigestMatchesCanonicalArtifact(t *testing.T) {
 		PolicySHA256    string `json:"breaking_policy_sha256"`
 	}
 	readJSON(t, repositoryPath(t, "contract/manifest.json"), &manifest)
-	if manifest.Owner != "kokoro-scheduler" || manifest.Artifact != "contract/openapi/v1/openapi.yaml" || manifest.ContractVersion != "1.0.0" || manifest.BreakingPolicy != "contract/openapi/v1/breaking-policy.json" {
+	if manifest.Owner != "kokoro-scheduler" || manifest.Artifact != "contract/openapi/v1/openapi.yaml" || manifest.ContractVersion != "2.0.0" || manifest.BreakingPolicy != "contract/openapi/v1/breaking-policy.json" {
 		t.Fatalf("contract provenance = %#v", manifest)
 	}
 	body, err := os.ReadFile(repositoryPath(t, manifest.Artifact))
@@ -511,5 +519,106 @@ func rejectDuplicateKeys(decoder *json.Decoder) error {
 		return err
 	default:
 		return fmt.Errorf("unexpected OpenAPI delimiter %q", delimiter)
+	}
+}
+
+func TestCurrentScheduleReadIsNotAMutationReceipt(t *testing.T) {
+	document := loadOpenAPI(t)
+	item := document.Paths["/internal/scheduler/v1/schedules/{name}"]
+	get := object(t, item, "get")
+	if _, hasBody := get["requestBody"]; hasBody {
+		t.Fatal("GET declares a command body")
+	}
+	for _, parameters := range []any{item["parameters"], get["parameters"]} {
+		if parameters == nil {
+			continue
+		}
+		for _, name := range referencedParameterNames(t, document, parameters) {
+			if name == "Idempotency-Key" {
+				t.Fatal("GET inherits a mutation identity")
+			}
+		}
+	}
+	if get["x-kokoro-idempotency"] != "read-only" {
+		t.Fatal("GET must be a read-only query")
+	}
+	responses := object(t, get, "responses")
+	if object(t, responses, "200")["$ref"] != "#/components/responses/CurrentSchedule" {
+		t.Fatal("GET uses an immutable command ACK")
+	}
+	for _, code := range []string{"400", "401", "404", "500"} {
+		if _, ok := responses[code]; !ok {
+			t.Errorf("GET missing %s", code)
+		}
+	}
+	schemas := object(t, document.Components, "schemas")
+	current := object(t, schemas, "CurrentSchedule")
+	if current["additionalProperties"] != false {
+		t.Fatal("current schedule must be closed")
+	}
+	required := scalarStrings(t, current["required"])
+	if !contains(required, "status") || !contains(required, "next_due_at") {
+		t.Fatal("current state/next must be explicit")
+	}
+	base := object(t, schemas, "Schedule")
+	properties := object(t, current, "properties")
+	baseProperties := object(t, base, "properties")
+	if len(properties) != len(baseProperties)+1 {
+		t.Fatal("current schedule duplicates or drops base fields")
+	}
+	for field, definition := range baseProperties {
+		if field == "next_due_at" {
+			continue
+		} // Current exhausted state has an explicit nullable next.
+		if !reflect.DeepEqual(properties[field], definition) {
+			t.Errorf("current schedule drifted at %s", field)
+		}
+	}
+	status := object(t, object(t, current, "properties"), "status")
+	if got := strings.Join(scalarStrings(t, status["enum"]), ","); got != "active,paused,exhausted" {
+		t.Fatalf("status=%s", got)
+	}
+	response := object(t, object(t, document.Components, "responses"), "CurrentSchedule")
+	cache := object(t, object(t, response, "headers"), "Cache-Control")
+	if object(t, cache, "schema")["const"] != "no-store" {
+		t.Fatal("GET must not be cached")
+	}
+}
+
+func TestFiniteScheduleContractRequiresExclusiveTriggerAndExhaustedNullNext(t *testing.T) {
+	document := loadOpenAPI(t)
+	schemas := object(t, document.Components, "schemas")
+	for _, name := range []string{"ScheduleInput", "Schedule", "CurrentSchedule"} {
+		schema := object(t, schemas, name)
+		properties := object(t, schema, "properties")
+		if _, ok := properties["run_at"]; !ok {
+			t.Fatalf("%s missing absolute trigger", name)
+		}
+		if contains(scalarStrings(t, schema["required"]), "schedule") {
+			t.Fatalf("%s still forces recurring cron", name)
+		}
+		branches, ok := schema["oneOf"].([]any)
+		if !ok || len(branches) != 2 {
+			t.Fatalf("%s missing exclusive triggers", name)
+		}
+		for i, field := range []string{"schedule", "run_at"} {
+			branch, ok := branches[i].(map[string]any)
+			if !ok || !reflect.DeepEqual(scalarStrings(t, branch["required"]), []string{field}) {
+				t.Fatalf("%s trigger branch=%#v", name, branches[i])
+			}
+		}
+	}
+	current := object(t, schemas, "CurrentSchedule")
+	conditions, ok := current["allOf"].([]any)
+	if !ok || len(conditions) != 1 {
+		t.Fatal("current status/next lifecycle constraint is missing")
+	}
+	conditional := conditions[0].(map[string]any)
+	then := object(t, conditional, "then")
+	if object(t, object(t, then, "properties"), "next_due_at")["type"] != "null" || !contains(scalarStrings(t, then["required"]), "run_at") {
+		t.Fatal("exhausted must be once and have no next")
+	}
+	if object(t, object(t, object(t, conditional, "else"), "properties"), "next_due_at")["type"] != "string" {
+		t.Fatal("live schedules must retain their actual next")
 	}
 }

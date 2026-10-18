@@ -7,14 +7,19 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
+	"time"
 
 	"github.com/LordFoxFairy/kokoro-scheduler/internal/domain"
 )
 
+var runAtPattern = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$`)
+
 type scheduleRequest struct {
 	Name          string          `json:"name"`
 	Schedule      string          `json:"schedule"`
+	RunAt         string          `json:"run_at"`
 	Timezone      string          `json:"timezone"`
 	URL           string          `json:"url"`
 	Method        string          `json:"method"`
@@ -70,8 +75,16 @@ func (r scheduleRequest) toDomain(tenantID, pathName string) (domain.Schedule, e
 	if r.Paused {
 		status = domain.SchedulePaused
 	}
+	var runAt time.Time
+	if r.RunAt != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, r.RunAt)
+		if err != nil || !runAtPattern.MatchString(r.RunAt) || parsed.IsZero() {
+			return domain.Schedule{}, errors.New("run_at must be a UTC RFC3339 instant at millisecond precision")
+		}
+		runAt = parsed
+	}
 	return (domain.Schedule{
-		TenantID: tenantID, Name: r.Name, Rule: r.Schedule, Timezone: r.Timezone,
+		TenantID: tenantID, Name: r.Name, Rule: r.Schedule, RunAt: runAt, Timezone: r.Timezone,
 		TargetURL: r.URL, Method: domain.Method(r.Method), Payload: r.Body,
 		Retry: retry, MisfirePolicy: domain.MisfirePolicy(r.MisfirePolicy),
 		CatchUpLimit: r.CatchUpLimit, OverlapPolicy: domain.OverlapPolicy(r.OverlapPolicy),
@@ -126,12 +139,17 @@ func decodePayload(r *http.Request, tenantID, pathName, action string) (domain.S
 			}
 		}
 	}
+	_, hasRule := raw["schedule"]
+	_, hasOnce := raw["run_at"]
+	if hasRule == hasOnce {
+		return domain.Schedule{}, nil, errors.New("exactly one of schedule or run_at is required")
+	}
 	var request scheduleRequest
 	if err := decodeSingleJSON(body, &request); err != nil {
 		return domain.Schedule{}, nil, fmt.Errorf("decode schedule: %w", err)
 	}
 	for field, value := range map[string]string{
-		"name": request.Name, "timezone": request.Timezone, "method": request.Method,
+		"name": request.Name, "timezone": request.Timezone, "method": request.Method, "run_at": request.RunAt, "schedule": request.Schedule,
 		"misfire_policy": request.MisfirePolicy, "overlap_policy": request.OverlapPolicy,
 	} {
 		if _, provided := raw[field]; provided && strings.TrimSpace(value) == "" {
@@ -157,6 +175,7 @@ func canonicalCommandPayload(schedule domain.Schedule) ([]byte, error) {
 		TenantID      string                `json:"tenant_id"`
 		Name          string                `json:"name"`
 		Schedule      string                `json:"schedule"`
+		RunAt         time.Time             `json:"run_at,omitzero"`
 		Timezone      string                `json:"timezone"`
 		URL           string                `json:"url"`
 		Method        domain.Method         `json:"method"`
@@ -167,7 +186,7 @@ func canonicalCommandPayload(schedule domain.Schedule) ([]byte, error) {
 		OverlapPolicy domain.OverlapPolicy  `json:"overlap_policy"`
 		Status        domain.ScheduleStatus `json:"status"`
 	}{
-		TenantID: schedule.TenantID, Name: schedule.Name, Schedule: schedule.Rule,
+		TenantID: schedule.TenantID, Name: schedule.Name, Schedule: schedule.Rule, RunAt: schedule.RunAt,
 		Timezone: schedule.Timezone, URL: schedule.TargetURL, Method: schedule.Method,
 		Body: schedule.Payload, Retry: schedule.Retry, MisfirePolicy: schedule.MisfirePolicy,
 		CatchUpLimit: schedule.CatchUpLimit, OverlapPolicy: schedule.OverlapPolicy, Status: schedule.Status,

@@ -20,7 +20,7 @@ type TxStore interface {
 	CreateSchedule(ctx context.Context, schedule domain.Schedule) (domain.Schedule, error)
 	UpdateSchedule(ctx context.Context, schedule domain.Schedule) (domain.Schedule, error)
 	DeleteSchedule(ctx context.Context, tenantID, name string) error
-	SetScheduleStatus(ctx context.Context, tenantID, name string, status domain.ScheduleStatus, nextDueAt, now time.Time) (domain.Schedule, error)
+	SetScheduleStatus(ctx context.Context, current domain.Schedule, status domain.ScheduleStatus, nextDueAt, now time.Time) (domain.Schedule, error)
 	GetSchedule(ctx context.Context, tenantID, name string) (domain.Schedule, error)
 
 	ClaimDueSchedules(ctx context.Context, now time.Time, workerID string, claimExpiresAt time.Time, limit int) ([]domain.Schedule, error)

@@ -18,6 +18,8 @@ const (
 	ResultResumed       = "resumed"
 	ResultAlreadyExists = "schedule_already_exists"
 	ResultNotFound      = "schedule_not_found"
+	ResultExhausted     = "schedule_exhausted"
+	ResultChanged       = "schedule_changed"
 )
 
 type CommandResult struct {

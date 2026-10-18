@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Kokoro Scheduler Internal API",
-    "version": "1.0.0",
+    "version": "2.0.0",
     "description": "Tenant-scoped durable schedule commands. PostgreSQL command receipts provide exact idempotent replay."
   },
   "servers": [
@@ -60,9 +60,6 @@
         },
         {
           "$ref": "#/components/parameters/RequestId"
-        },
-        {
-          "$ref": "#/components/parameters/IdempotencyKey"
         }
       ],
       "post": {
@@ -111,8 +108,15 @@
           }
         },
         "x-kokoro-control-error-codes": {
-          "409": "schedule_already_exists"
-        }
+          "409": [
+            "schedule_already_exists"
+          ]
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ]
       },
       "put": {
         "operationId": "replaceSchedule",
@@ -163,8 +167,15 @@
           }
         },
         "x-kokoro-control-error-codes": {
-          "404": "schedule_not_found"
-        }
+          "404": [
+            "schedule_not_found"
+          ]
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ]
       },
       "delete": {
         "operationId": "deleteSchedule",
@@ -215,8 +226,52 @@
           }
         },
         "x-kokoro-control-error-codes": {
-          "404": "schedule_not_found"
-        }
+          "404": [
+            "schedule_not_found"
+          ]
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ]
+      },
+      "get": {
+        "operationId": "getCurrentSchedule",
+        "summary": "Read the current tenant-scoped schedule, not its original command receipt.",
+        "x-kokoro-owner": "kokoro-scheduler",
+        "x-kokoro-visibility": "internal-owner",
+        "x-kokoro-stability": "stable",
+        "x-kokoro-idempotency": "read-only",
+        "x-kokoro-permission": "service-token",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/CurrentSchedule"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "x-kokoro-control-error-codes": {
+          "404": [
+            "schedule_not_found"
+          ]
+        },
+        "description": "No query parameters or request body. No Idempotency-Key required. Current state may change after the read; all responses are no-store. X-Request-Id refers to this read, never the prior mutation."
       }
     },
     "/internal/scheduler/v1/schedules/{name}/pause": {
@@ -277,8 +332,15 @@
           }
         },
         "x-kokoro-control-error-codes": {
-          "404": "schedule_not_found"
-        }
+          "404": [
+            "schedule_not_found"
+          ],
+          "409": [
+            "schedule_exhausted",
+            "schedule_changed"
+          ]
+        },
+        "description": "Exhausted schedules are not revived; return durable 409 schedule_exhausted. A concurrent resource/version change returns durable 409 schedule_changed. Resume a paused once schedule at its original run_at, applying its misfire policy when late."
       }
     },
     "/internal/scheduler/v1/schedules/{name}/resume": {
@@ -339,8 +401,15 @@
           }
         },
         "x-kokoro-control-error-codes": {
-          "404": "schedule_not_found"
-        }
+          "404": [
+            "schedule_not_found"
+          ],
+          "409": [
+            "schedule_exhausted",
+            "schedule_changed"
+          ]
+        },
+        "description": "Exhausted schedules are not revived; return durable 409 schedule_exhausted. A concurrent resource/version change returns durable 409 schedule_changed. Resume a paused once schedule at its original run_at, applying its misfire policy when late."
       }
     }
   },
@@ -457,6 +526,31 @@
             }
           }
         }
+      },
+      "CurrentSchedule": {
+        "description": "Current tenant-scoped row. Active/paused retain a non-null next_due_at; exhausted once schedules have null next. Exhausted is not dispatch/Agent success.",
+        "headers": {
+          "Cache-Control": {
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "no-store"
+            }
+          },
+          "X-Request-Id": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/CurrentScheduleResponse"
+            }
+          }
+        }
       }
     },
     "schemas": {
@@ -494,7 +588,6 @@
         "type": "object",
         "additionalProperties": false,
         "required": [
-          "schedule",
           "url"
         ],
         "properties": {
@@ -565,8 +658,27 @@
           "paused": {
             "type": "boolean",
             "default": false
+          },
+          "run_at": {
+            "type": "string",
+            "format": "date-time",
+            "maxLength": 24,
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,3})?Z$",
+            "description": "Absolute one-time UTC instant at millisecond precision. Must be future for a new create/replace; an original durable receipt replays unchanged after due."
           }
-        }
+        },
+        "oneOf": [
+          {
+            "required": [
+              "schedule"
+            ]
+          },
+          {
+            "required": [
+              "run_at"
+            ]
+          }
+        ]
       },
       "Schedule": {
         "type": "object",
@@ -574,7 +686,6 @@
         "required": [
           "id",
           "name",
-          "schedule",
           "timezone",
           "url",
           "method",
@@ -668,8 +779,27 @@
           "version": {
             "type": "integer",
             "minimum": 1
+          },
+          "run_at": {
+            "type": "string",
+            "format": "date-time",
+            "maxLength": 24,
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,3})?Z$",
+            "description": "Absolute one-time UTC instant at millisecond precision. Must be future for a new create/replace; an original durable receipt replays unchanged after due."
           }
-        }
+        },
+        "oneOf": [
+          {
+            "required": [
+              "schedule"
+            ]
+          },
+          {
+            "required": [
+              "run_at"
+            ]
+          }
+        ]
       },
       "ScheduleCommandResponse": {
         "type": "object",
@@ -929,6 +1059,189 @@
           "max_backoff_seconds",
           "max_retry_window_seconds"
         ]
+      },
+      "CurrentSchedule": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "name",
+          "timezone",
+          "url",
+          "method",
+          "body",
+          "retry",
+          "misfire_policy",
+          "catch_up_limit",
+          "overlap_policy",
+          "paused",
+          "next_due_at",
+          "version",
+          "status"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+            "maxLength": 64
+          },
+          "schedule": {
+            "type": "string",
+            "maxLength": 256,
+            "description": "Five-field minute/hour/day-of-month/month/day-of-week cron, a supported descriptor, or @every duration. DOM and DOW use standard cron OR semantics when both are restricted.",
+            "minLength": 1
+          },
+          "timezone": {
+            "type": "string",
+            "default": "UTC",
+            "description": "UTC or an IANA area/location name.",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^(UTC|[^/]+/.+)$"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Absolute HTTP(S) target URL; runtime egress policy also validates the resolved address."
+          },
+          "method": {
+            "type": "string",
+            "enum": [
+              "POST",
+              "PUT"
+            ],
+            "default": "POST"
+          },
+          "body": {
+            "type": "object",
+            "default": {}
+          },
+          "retry": {
+            "$ref": "#/components/schemas/ResolvedRetryPolicy"
+          },
+          "misfire_policy": {
+            "type": "string",
+            "enum": [
+              "skip",
+              "fire_once",
+              "catch_up_bounded"
+            ],
+            "default": "fire_once"
+          },
+          "catch_up_limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 1,
+            "description": "Must equal 1 unless misfire_policy is catch_up_bounded."
+          },
+          "overlap_policy": {
+            "type": "string",
+            "enum": [
+              "allow",
+              "forbid"
+            ],
+            "default": "forbid"
+          },
+          "paused": {
+            "type": "boolean",
+            "default": false
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "next_due_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "pattern": "Z$",
+            "description": "Current next UTC instant; null exactly when a once schedule is exhausted. Not the target execution outcome."
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "paused",
+              "exhausted"
+            ],
+            "description": "Current planner eligibility; not a target execution outcome."
+          },
+          "run_at": {
+            "type": "string",
+            "format": "date-time",
+            "maxLength": 24,
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,3})?Z$",
+            "description": "Absolute one-time UTC instant at millisecond precision. Must be future for a new create/replace; an original durable receipt replays unchanged after due."
+          }
+        },
+        "oneOf": [
+          {
+            "required": [
+              "schedule"
+            ]
+          },
+          {
+            "required": [
+              "run_at"
+            ]
+          }
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "exhausted"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "run_at"
+              ],
+              "properties": {
+                "next_due_at": {
+                  "type": "null"
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "next_due_at": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "CurrentScheduleResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "schedule"
+            ],
+            "properties": {
+              "schedule": {
+                "$ref": "#/components/schemas/CurrentSchedule"
+              }
+            }
+          }
+        }
       }
     }
   },

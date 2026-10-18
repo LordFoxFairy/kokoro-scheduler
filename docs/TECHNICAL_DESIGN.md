@@ -1,3 +1,21 @@
+## 2026-10-18 通用一次性调度（目标契约 2.0.0，隔离实施）
+
+沿既定边界实现，不新增进程/依赖/业务周期类型。Schedule 以既有 rule 或新绝对 UTC run_at 二选一表达触发源；BFF 负责自然语言/本地日历、MCP工具参数与产品归属，Scheduler 不接收用户token、工具名或连接凭据。MCP工具只应复用BFF任务用例；该新协议入口及定时Run所选MCP上下文仍属后继，不在本片假称已接入。
+
+当前 once 的首次 create/replace 只接受未来毫秒精度 instant；静态校验在receipt前，随时间变化的未来校验必须在同key原receipt检查之后，保证到点后原ACK仍能重放。pause不丢原 due，resume一次性任务仍以原run_at为due，过期按既有misfire政策处理；resume使用已读version做CAS，防止覆盖并发replace/planner。已exhausted的pause/resume返回持久化409 schedule_exhausted，不复活；显式replace+新key可建立未来触发，原occurrence身份/历史不变。
+
+once到点最多物化一条occurrence；按时触发，错过时skip产生可观察skipped，fire_once/catch_up_bounded均最多一条dispatch。occurrence/outbox、status=exhausted、next_due_at=NULL、claim清空和version递增在同一本地事务；仍受原version+claim CAS保护，失败整体回滚。exhausted仅表示不再生成触发，不表示目标或Agent执行成功；已物化outbox继续既有重试，pause/delete也不冒充已派发执行取消。旧receipt、occurrence与outbox不迁移、不清空。
+
+新增RunAt仍用领域time.Time，零值只在内部表示缺失；SQL nullable值在adapter转换，HTTP明确缺字段或null：recurring返回schedule、once返回run_at，current exhausted必须next_due_at=null。原recurring命令digest与历史ACK序列化保持原样；新once digest加入run_at。只改现domain/application/PG/HTTP及canonical契约，不新增通用调度抽象。正常库不执行DDL/重载；fresh schema与真实PG并发、回滚、重建、重放、有限重试由独占fixture验证。
+
+## 2026-10-18 通用周期收敛：当前状态读取切片
+
+既定边界：BFF 拥有用户选择的多星期、月内多日期及本地日期；Scheduler 只解释通用 recurrence/绝对一次性 instant，不引入项目、会话、Skills 或业务周期枚举。完整 once/exhausted 后继实施，本切片不提前声明其存在。
+
+当前 mutation receipt 是不可变首次结果，不能充当实时 next/status。增加同资源 GET，由现 HTTP handler → application.Service.Get → 同一 Store transaction 的 tenant/name GetSchedule 读取当前行；复用既有 port，不增加 query bus、服务、缓存或轮询器。GET 沿用 service token、可信 tenant 和 request ID；不经过 Execute，不获取 command identity 锁、不写 receipt。取消传递到现数据库事务，缺失或其他租户同为 404，存储失败不冒充缺失。当前读取和后续更新不具有跨请求快照保证。
+
+写区为本 owner application/HTTP、canonical OpenAPI、对应测试与三设计面。现 Schema、mutation wire/历史 receipt、planner/dispatcher 不变；GET 只承诺当前 active/paused 与非空 next，有限调度的 nullable next/status 演进另行配对。验证包含 HTTP 验证/隔离/取消、contract parity，以及独占 PG 上 planner 推进、pause、原 receipt 精确重放和 GET 前后四表事实不变。不重载正常 Scheduler、不启用正常任务/模型/扣费。
+
 ## R45-WIN09：fixture 阻断返修，catalog 未到行为门（2026-10-01）
 
 Root 自有 PG 首轮实际 24 顶层 **18 PASS / 6 FAIL，1.388s**；六个新资源用例均在完整四表 beforeSnapshot 因 occurrence 无 sentinel 失败，未进入 catalog/function/type 目标断言，不计结构行为 RED。日志 `/tmp/kokoro-scheduler-catalog-r45-root-resource.log`，Root 报告 owned database 已回收。

@@ -1,3 +1,15 @@
+## 2026-10-18 一次性触发与有限耗尽
+
+唯一canonical database/schema.sql中仅改scheduler_schedule：schedule_rule改nullable，新增run_at TIMESTAMPTZ(3)，next_due_at改nullable，status扩exhausted。CHECK保证rule非空且run_at空，或rule空且run_at非空（二选一）；exhausted仅用于once，next必须NULL且无claim；active/paused的next非空，once next必须等于run_at。paused无claim；现有唯一身份、tenant和retry约束保持。其余三表定义/历史不变。
+
+planner对once的occurrence/outbox和schedule耗尽在同一事务，以version/claim防晚planner；NULL只代表已无下一触发，不用空串、当前时间、年度cron或自动delete伪装。resume通过version CAS与exhausted guard防止复活，失败结果仍原receipt记账。旧RunAt缺失的receipt按原struct读取，新增可选字段零值不写回；原receipt JSONB不执行升级或改写。fresh安装与对照源仍唯一canonical；不新增自动migration、旁路表、队列或业务owner。正常库定向演进另需具名备份/授权，本片不执行。
+
+## 2026-10-18 当前状态查询的数据边界
+
+不变更 canonical 四表或索引。当前 GET 只在既有 Store transaction 中按 `(tenant_id, name)` 读取 scheduler_schedule，返回当前定义、status、next_due_at 和 version；不读取别的 owner 数据。没有 read receipt、查询缓存、派生业务状态或额外持久化。
+
+读取不改变 scheduler_command_receipt 的原 request ID/result，也不推进 next 或创建 occurrence/outbox。planner/command 可在读取前后提交，当前行仅代表该读取时点，不保证与旧 ACK 相同。现 status 仍仅 active/paused、next 非空；generic once 的数据 XOR/耗尽事务属于后继明确切片，不能以本 GET 宣称已支持。
+
 ## R45-WIN09：补完整四表 fixture，不放宽证据（2026-10-01）
 
 Root 实际 PG 首轮 **18 PASS / 6 FAIL，1.388s**，日志 `/tmp/kokoro-scheduler-catalog-r45-root-resource.log`。现 `prepareStoreBoundaryFixture` 只填 schedule/receipt，而新增用例立即调用要求四表都有事实的 `namespaceBoundaryFactsSnapshot`，因此在 occurrence sentinel 缺失处终止；未证明 catalog 正例或漂移行为。

@@ -85,6 +85,8 @@ curl -fsS -X POST \
   }'
 ```
 
+当前状态使用同资源 `GET /internal/scheduler/v1/schedules/{name}` 读取，携带相同服务认证、可信 tenant 和 request ID，不传 body、query 或幂等键。返回当前 `data.schedule.status/next_due_at/version`，响应不缓存；原 mutation receipt 只代表首次操作结果，不会随 planner 推进而更新。一次性调度已在当前源码和隔离资源中实现，正常环境尚未升级；BFF/Agent/MCP消费接线仍待配对。
+
 API 时间均为 RFC3339 UTC；周期规则单独保存 IANA timezone。默认 misfire 为 `fire_once`，默认 overlap 为 `forbid`，每次跳过都会持久化 outcome，不存在无记录的 still-running skip。
 
 ## Recurrence contract
@@ -97,6 +99,14 @@ API 时间均为 RFC3339 UTC；周期规则单独保存 IANA timezone。默认 m
 - `@every DURATION`，范围 1 秒至 366 天、毫秒精度。
 
 DOM 与 DOW 都受限时使用标准 OR 语义；任一字段为无 step 的 `*` 时由另一字段筛选。不存在的日期在写入前拒绝。DST spring-forward 缺失的本地时刻不触发；fall-back 重复的本地时刻对应两个不同 UTC occurrence。完整语义和测试位置见 [docs/TECHNICAL_DESIGN.md](./docs/TECHNICAL_DESIGN.md)。
+
+## 一次性调度
+
+POST/PUT 的触发字段为 `schedule` 或 `run_at` 恰一个：前者为通用 cron/interval，后者例如 `"run_at":"2026-11-01T05:30:00Z"`，是未来 UTC instant，支持至毫秒精度。不要把一次性任务写成每年重复 cron。首次命令的未来时间校验不影响同 key 原 receipt 在到点后的精确重放。
+
+到点后一次性任务以同一事务记录 occurrence、可选 dispatch outbox 与 `exhausted`，当前 GET 的 `next_due_at` 为 null；它只表示不再生成下一触发，不代表目标执行成功。已物化投递仍按既有策略重试。暂停后恢复保留原 run_at，迟到按 skip/fire_once/catch_up_bounded 处理（一次性最多一个触发）。耗尽后 pause/resume 返回 409 schedule_exhausted，显式完整替换与新命令可设置未来触发；并发身份/版本变化返回 409 schedule_changed。
+
+Scheduler 不拥有业务任务、项目、会话、工具选择或连接凭据。Agent 定时 MCP 管理入口应由 BFF 复用任务用例；到点经业务 owner 派发 Agent Run。这个产品接线尚未在本仓实现。契约 2.0.0 必须与消费者配对；本地仍使用旧 Schema/二进制的正常服务不要直接重载。这里没有自动迁移非空库的命令。
 
 ## 配置
 

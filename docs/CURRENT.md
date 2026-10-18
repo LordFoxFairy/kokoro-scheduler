@@ -1,3 +1,21 @@
+## 2026-10-18 Generic once producer（本地验证完成，消费者/正常激活待接）
+
+沿原e8dca48与已验current GET切片，现同需求分支实现rule/run_at XOR、未来UTC毫秒instant、once耗尽与current null next；不引入业务frequency/项目/MCP凭据。occurrence/outbox/耗尽/claim/version同事务，原key到点后仍重放原ACK，pause/resume采用id+version CAS且不复活exhausted，旧三事实表定义逐字不变。canonical contract升2.0.0，错误登记按status列出代码数组（pause/resume的409含exhausted/changed）；无兼容alias或新依赖。
+
+主方默认Go输出含子项215 PASS/32资源SKIP；另独占真实PG完整integration＋源码进程重启smoke共30顶层/57含子项PASS、0SKIP。vet/build/contract-check、gofmt/diff通过，75非文档输入冻结不变。新增真实PG＋loopback HTTP覆盖耗尽/null current和原ACK；已提交后丢ACK、双worker、暂停跨due、取消回滚/claim恢复、stale/ABA、旧digest与受控TargetClient重试均有定向证据。重试使用替身目标，不称实际工具或业务HTTP目标执行。源码进程smoke验证原recurring receipt重启恢复，不冒充once全runtime故障矩阵。
+
+独审发现的run_at词法P2已同源regex修复并复核：单数字小时原200→400，组合小数边界回归亦通过。首轮完整Go因旧schema断言仍锁两状态失败，已配对新三状态并完整重跑，不删约束断言。资源schema/临时库及源码smoke进程由fixture回收，原始收据仅Root ignored var/dev/scheduler-once-20261018。
+
+BFF固定producer/pin/多规则、App与Agent定时MCP仍OPEN；当前正常Scheduler仍旧二进制/Schema，不可直接重载此候选。未改正常数据库、任务、登录、账号或模型/资金配置；模型/实际工具执行、扣费、CI与远端PR暂停。下方GET1.1是先前阶段事实，不覆盖本节2.0当前实现。
+
+## 2026-10-18 当前 Schedule 查询切片（本地未提交）
+
+基线 e8dca48988c4a93fa31bce3ee37f978394143c10；同需求分支 codex/generic-once-scheduler。当前 GET 已实现：受信 service/tenant/request ID 后读取本租户当前 Schedule；不走 command Execute、回执或 planner。contract 1.1.0 与 manifest/运行 parity 同步，旧 mutation/dispatch 契约语义保留；canonical Schema 与正常 runtime 不变。细节见本轮三设计面前缀。
+
+主方 gofmt/diff、vet、默认 test、build 和 contract-check 通过；默认92顶层PASS/26资源SKIP，另自有临时 PG完整integration25顶层（含子项49）PASS/0SKIP，随机schema及临时库清理完毕。新增真实 HTTP+PG 证明当前next推进/暂停、tenant隔离、不可变ACK与GET四表无写入；只读审查未发现确定P0–P2。原始日志、冻结与收据仅 Root ignored var/dev/scheduler-current-20261018。
+
+不是完整有限调度交付：目前 status仍active/paused、next仍非空。generic once/exhausted 与 BFF多星期/月内多日期、consumer配对仍待实施；不向 Scheduler引入业务周期类型。未改正常库、进程或任务，不启动模型/实际Agent执行/扣费/CI，不推送或操作远端PR。
+
 ## R46 Root namespace/fullcatalog 当前验收证据（2026-10-01）
 
 候选基线 main 9a4effd150ab739acaed2579faa94618bb26f772，完整20path、唯一canonical4表不变。Root Go1.26.8/GOMAXPROCS=2：gofmt输出为空、go vet -p1 ./...、go build -p1 ./...均exit0；完整go test -p1 -count1 -timeout120s -v ./...实际167pass/25既有资源skip（含子例），/tmp/kokoro-scheduler-r46-root-pure.log。资源skip不计通过。

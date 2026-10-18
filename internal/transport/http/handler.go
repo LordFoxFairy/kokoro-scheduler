@@ -28,6 +28,7 @@ type ReadinessProbe func(context.Context) error
 
 type CommandService interface {
 	Execute(context.Context, application.Command) (domain.CommandReceipt, error)
+	Get(context.Context, string, string) (domain.Schedule, error)
 }
 
 type Handler struct {
@@ -89,6 +90,9 @@ func probeRequestID(r *http.Request) string {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		w.Header().Set("Cache-Control", "no-store")
+	}
 	requestID := strings.TrimSpace(r.Header.Get(requestIDHeader))
 	requestIDErr := validateRequestID(requestID)
 	responseRequestID := ""
@@ -121,6 +125,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !supportedMethod(r.Method, action) {
 		w.Header().Set("Allow", allowedMethods(action))
 		writeJSON(w, http.StatusMethodNotAllowed, errorResponse("method_not_allowed", "method not allowed", requestID))
+		return
+	}
+	if r.Method == http.MethodGet {
+		h.readSchedule(w, r, tenantID, name, requestID)
 		return
 	}
 	idempotencyKey := r.Header.Get(idempotencyKeyHeader)
@@ -157,6 +165,28 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set(requestIDHeader, receipt.RequestID)
 	status, response := receiptResponse(receipt)
 	writeJSON(w, status, response)
+}
+
+func (h *Handler) readSchedule(w http.ResponseWriter, r *http.Request, tenantID, name, requestID string) {
+	body, err := readBody(r)
+	if err != nil || len(body) != 0 || r.URL.RawQuery != "" || r.URL.ForceQuery {
+		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_schedule_read", "schedule reads accept no query or body", requestID))
+		return
+	}
+	if h.service == nil {
+		writeJSON(w, http.StatusInternalServerError, errorResponse("scheduler_read_failed", "scheduler schedule could not be read", requestID))
+		return
+	}
+	schedule, err := h.service.Get(r.Context(), tenantID, name)
+	if err != nil {
+		if errors.Is(err, domain.ErrScheduleNotFound) {
+			writeJSON(w, http.StatusNotFound, errorResponse("schedule_not_found", "scheduler schedule was not found", requestID))
+		} else {
+			writeJSON(w, http.StatusInternalServerError, errorResponse("scheduler_read_failed", "scheduler schedule could not be read", requestID))
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{"schedule": currentScheduleResponse{scheduleResponse: toScheduleResponse(schedule), Status: string(schedule.Status)}}})
 }
 
 func operationFor(method, action string) domain.CommandOperation {

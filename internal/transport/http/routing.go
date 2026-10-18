@@ -27,14 +27,14 @@ func supportedMethod(method, action string) bool {
 	if action != "" {
 		return method == http.MethodPost
 	}
-	return method == http.MethodPost || method == http.MethodPut || method == http.MethodDelete
+	return method == http.MethodGet || method == http.MethodPost || method == http.MethodPut || method == http.MethodDelete
 }
 
 func allowedMethods(action string) string {
 	if action != "" {
 		return http.MethodPost
 	}
-	return strings.Join([]string{http.MethodPost, http.MethodPut, http.MethodDelete}, ", ")
+	return strings.Join([]string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete}, ", ")
 }
 
 func validateRequestID(requestID string) error {

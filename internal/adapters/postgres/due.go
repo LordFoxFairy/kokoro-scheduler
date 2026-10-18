@@ -97,10 +97,10 @@ func (s *txStore) InsertDispatchOutbox(ctx context.Context, schedule domain.Sche
 func (s *txStore) AdvanceSchedule(ctx context.Context, schedule domain.Schedule, workerID string, nextDueAt, now time.Time) error {
 	result, err := s.tx.Exec(ctx, `
         UPDATE scheduler_schedule
-           SET next_due_at = $4, claim_owner = NULL, claim_expires_at = NULL,
+           SET next_due_at = $4::timestamptz, status = CASE WHEN $4::timestamptz IS NULL THEN 'exhausted' ELSE status END, claim_owner = NULL, claim_expires_at = NULL,
                version = version + 1, updated_at = $5
          WHERE tenant_id = $1 AND id = $2::uuid AND version = $3 AND claim_owner = $6`,
-		schedule.TenantID, schedule.ID, schedule.Version, nextDueAt, now, workerID,
+		schedule.TenantID, schedule.ID, schedule.Version, nullableInstant(nextDueAt), now, workerID,
 	)
 	if err != nil {
 		return err

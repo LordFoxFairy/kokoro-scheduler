@@ -1,5 +1,5 @@
 {
-  "contract_major": 1,
+  "contract_major": 2,
   "required_paths": {
     "/healthz": [
       "get"
@@ -8,6 +8,7 @@
       "get"
     ],
     "/internal/scheduler/v1/schedules/{name}": [
+      "get",
       "post",
       "put",
       "delete"
@@ -29,7 +30,8 @@
     "misfire_policy",
     "catch_up_limit",
     "overlap_policy",
-    "paused"
+    "paused",
+    "run_at"
   ],
   "required_occurrence_fields": [
     "id",
@@ -77,7 +79,8 @@
     "overlap_policy",
     "paused",
     "next_due_at",
-    "version"
+    "version",
+    "run_at"
   ],
   "required_resolved_retry_fields": [
     "max_attempts",
@@ -87,19 +90,42 @@
   ],
   "required_control_errors": {
     "createSchedule": {
-      "409": "schedule_already_exists"
+      "409": [
+        "schedule_already_exists"
+      ]
     },
     "replaceSchedule": {
-      "404": "schedule_not_found"
+      "404": [
+        "schedule_not_found"
+      ]
     },
     "deleteSchedule": {
-      "404": "schedule_not_found"
+      "404": [
+        "schedule_not_found"
+      ]
+    },
+    "getCurrentSchedule": {
+      "404": [
+        "schedule_not_found"
+      ]
     },
     "pauseSchedule": {
-      "404": "schedule_not_found"
+      "404": [
+        "schedule_not_found"
+      ],
+      "409": [
+        "schedule_exhausted",
+        "schedule_changed"
+      ]
     },
     "resumeSchedule": {
-      "404": "schedule_not_found"
+      "404": [
+        "schedule_not_found"
+      ],
+      "409": [
+        "schedule_exhausted",
+        "schedule_changed"
+      ]
     }
   }
 }
