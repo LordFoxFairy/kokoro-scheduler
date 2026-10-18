@@ -1,5 +1,5 @@
 {
-  "contract_major": 2,
+  "contract_major": 3,
   "required_paths": {
     "/healthz": [
       "get"
@@ -97,6 +97,9 @@
     "replaceSchedule": {
       "404": [
         "schedule_not_found"
+      ],
+      "409": [
+        "schedule_changed"
       ]
     },
     "deleteSchedule": {

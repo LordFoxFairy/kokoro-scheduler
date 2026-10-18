@@ -144,8 +144,24 @@ func (s *Service) prepare(command Command) (Command, error) {
 func (s *Service) apply(ctx context.Context, tx ports.TxStore, command Command) (domain.CommandResult, error) {
 	now := domain.NormalizeInstant(s.clock.Now())
 	// A replay was already resolved before reaching this time-dependent check.
+	var current domain.Schedule
 	if command.Operation == domain.CommandCreate || command.Operation == domain.CommandUpdate {
-		if !command.Schedule.RunAt.IsZero() {
+		if command.Operation == domain.CommandUpdate {
+			var err error
+			current, err = tx.GetSchedule(ctx, command.TenantID, command.Name)
+			if errors.Is(err, domain.ErrScheduleNotFound) {
+				return domain.CommandResult{Code: domain.ResultNotFound, Name: command.Name}, nil
+			}
+			if err != nil {
+				return domain.CommandResult{}, err
+			}
+		}
+		if command.Operation == domain.CommandUpdate && !command.Schedule.RunAt.IsZero() && command.Schedule.RunAt.Equal(current.RunAt) {
+			command.Schedule.NextDueAt = current.NextDueAt
+			if current.Status == domain.ScheduleExhausted {
+				command.Schedule.Status = domain.ScheduleExhausted
+			}
+		} else if !command.Schedule.RunAt.IsZero() {
 			if !command.Schedule.RunAt.After(now) {
 				return domain.CommandResult{}, ErrInvalidCommand
 			}
@@ -168,9 +184,12 @@ func (s *Service) apply(ctx context.Context, tx ports.TxStore, command Command) 
 		}
 		return scheduleResult(domain.ResultRegistered, created, err)
 	case domain.CommandUpdate:
-		updated, err := tx.UpdateSchedule(ctx, command.Schedule)
+		updated, err := tx.UpdateSchedule(ctx, current, command.Schedule)
 		if errors.Is(err, domain.ErrScheduleNotFound) {
 			return domain.CommandResult{Code: domain.ResultNotFound, Name: command.Name}, nil
+		}
+		if errors.Is(err, domain.ErrScheduleChanged) {
+			return domain.CommandResult{Code: domain.ResultChanged, Name: command.Name}, nil
 		}
 		return scheduleResult(domain.ResultUpdated, updated, err)
 	case domain.CommandDelete:

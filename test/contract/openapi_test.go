@@ -28,7 +28,7 @@ func TestCanonicalOpenAPIHasNoDuplicateObjectKeys(t *testing.T) {
 
 func TestCanonicalOpenAPIIsParseableAndOwnsEveryHTTPRoute(t *testing.T) {
 	document := loadOpenAPI(t)
-	if document.OpenAPI != "3.1.0" || document.Info.Version != "2.0.0" {
+	if document.OpenAPI != "3.1.0" || document.Info.Version != "3.0.0" {
 		t.Fatalf("OpenAPI/version = %q/%q", document.OpenAPI, document.Info.Version)
 	}
 	wantPaths := []string{
@@ -305,7 +305,7 @@ func TestContractProvenanceDigestMatchesCanonicalArtifact(t *testing.T) {
 		PolicySHA256    string `json:"breaking_policy_sha256"`
 	}
 	readJSON(t, repositoryPath(t, "contract/manifest.json"), &manifest)
-	if manifest.Owner != "kokoro-scheduler" || manifest.Artifact != "contract/openapi/v1/openapi.yaml" || manifest.ContractVersion != "2.0.0" || manifest.BreakingPolicy != "contract/openapi/v1/breaking-policy.json" {
+	if manifest.Owner != "kokoro-scheduler" || manifest.Artifact != "contract/openapi/v1/openapi.yaml" || manifest.ContractVersion != "3.0.0" || manifest.BreakingPolicy != "contract/openapi/v1/breaking-policy.json" {
 		t.Fatalf("contract provenance = %#v", manifest)
 	}
 	body, err := os.ReadFile(repositoryPath(t, manifest.Artifact))
@@ -620,5 +620,24 @@ func TestFiniteScheduleContractRequiresExclusiveTriggerAndExhaustedNullNext(t *t
 	}
 	if object(t, object(t, object(t, conditional, "else"), "properties"), "next_due_at")["type"] != "string" {
 		t.Fatal("live schedules must retain their actual next")
+	}
+	ack := object(t, schemas, "Schedule")
+	if !reflect.DeepEqual(scalarStrings(t, object(t, object(t, ack, "properties"), "next_due_at")["type"]), []string{"string", "null"}) {
+		t.Fatal("mutation ACK cannot describe a consumed once edit")
+	}
+	conditions, ok = ack["allOf"].([]any)
+	if !ok || len(conditions) != 1 {
+		t.Fatal("mutation null next must be limited to consumed once")
+	}
+	guard := conditions[0].(map[string]any)
+	if object(t, object(t, object(t, guard, "if"), "properties"), "next_due_at")["type"] != "null" {
+		t.Fatal("mutation lifecycle guard must inspect null next")
+	}
+	consumed := object(t, guard, "then")
+	if !contains(scalarStrings(t, consumed["required"]), "run_at") || object(t, object(t, consumed, "properties"), "paused")["const"] != false {
+		t.Fatal("consumed ACK must be once and not imply paused/live")
+	}
+	if _, exists := object(t, ack, "properties")["status"]; exists {
+		t.Fatal("mutation ACK must retain the historical field set")
 	}
 }

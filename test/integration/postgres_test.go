@@ -1950,6 +1950,37 @@ func TestPostgresOnceExhaustsAtomicallyAndReplaysAfterLostCommitAck(t *testing.T
 			t.Fatalf("%s result=%#v err=%v", op, got, err)
 		}
 	}
+	// Editing this same trigger after consumption cannot create a second execution,
+	// even when the command ACK is lost or the clock later moves backwards.
+	edit := command
+	edit.Operation = domain.CommandUpdate
+	edit.CommandScope = "PUT:once"
+	edit.IdempotencyKey = "edit-exhausted-once"
+	edit.Schedule.Status = domain.SchedulePaused
+	edit.Schedule.Payload = []byte(`{"revision":2}`)
+	fault.lose = true
+	if _, err := service.Execute(ctx, edit); err == nil {
+		t.Fatal("committed edit with lost ACK must remain unknown")
+	}
+	edited, err := rebuilt.Execute(ctx, edit)
+	if err != nil || edited.Result.Code != domain.ResultUpdated || edited.Result.Schedule.Status != domain.ScheduleExhausted || !edited.Result.Schedule.NextDueAt.IsZero() {
+		t.Fatalf("exhausted edit=%#v err=%v", edited, err)
+	}
+	var editedPayload map[string]int
+	if err := json.Unmarshal(edited.Result.Schedule.Payload, &editedPayload); err != nil || !reflect.DeepEqual(editedPayload, map[string]int{"revision": 2}) {
+		t.Fatalf("edited payload=%s err=%v", edited.Result.Schedule.Payload, err)
+	}
+	clock.Advance(-48 * time.Hour)
+	edit.IdempotencyKey = "edit-exhausted-clock-rollback"
+	edit.Schedule.Status = domain.ScheduleActive
+	if result, err := rebuilt.Execute(ctx, edit); err != nil || result.Result.Schedule.Status != domain.ScheduleExhausted || !result.Result.Schedule.NextDueAt.IsZero() {
+		t.Fatalf("clock rollback revived trigger: %#v err=%v", result, err)
+	}
+	clock.Advance(48 * time.Hour)
+	var originalQueuedPayload bool
+	if err := pool.QueryRow(ctx, `SELECT payload = '{}'::jsonb FROM scheduler_dispatch_outbox`).Scan(&originalQueuedPayload); err != nil || !originalQueuedPayload {
+		t.Fatalf("consumed edit changed queued payload: original=%v err=%v", originalQueuedPayload, err)
+	}
 	// Exhaustion stops new occurrences, not the already committed retry outbox.
 	target := &doubles.TargetClient{Results: []domain.DispatchResult{{Status: 503}, {Status: 202}}}
 	dispatcher, _ := application.NewDispatcher(application.DispatcherDependencies{Store: store, Clock: clock, Random: &doubles.RandomSource{}, Target: target, WorkerID: "once-delivery"})
@@ -2008,6 +2039,14 @@ func TestPostgresOnceResumeKeepsOriginalDueAndMisfirePolicy(t *testing.T) {
 				t.Fatal(err)
 			}
 			clock.Advance(5 * time.Minute)
+			edit := command
+			edit.Operation = domain.CommandUpdate
+			edit.CommandScope = "PUT:paused-once"
+			edit.IdempotencyKey = "edit-paused-past-once"
+			edit.Schedule.Payload = []byte(`{"revision":2}`)
+			if result, err := service.Execute(ctx, edit); err != nil || result.Result.Schedule.Status != domain.SchedulePaused || !result.Result.Schedule.NextDueAt.Equal(command.Schedule.RunAt) {
+				t.Fatalf("paused edit lost original due: %#v err=%v", result, err)
+			}
 			resume := command
 			resume.Operation = domain.CommandResume
 			resume.CommandScope = "resume:once"
@@ -2015,6 +2054,11 @@ func TestPostgresOnceResumeKeepsOriginalDueAndMisfirePolicy(t *testing.T) {
 			ack, err := service.Execute(ctx, resume)
 			if err != nil || !ack.Result.Schedule.NextDueAt.Equal(command.Schedule.RunAt) {
 				t.Fatalf("resume=%#v err=%v", ack, err)
+			}
+			edit.IdempotencyKey = "edit-active-past-once"
+			edit.Schedule.Status = domain.ScheduleActive
+			if result, err := service.Execute(ctx, edit); err != nil || result.Result.Schedule.Status != domain.ScheduleActive || !result.Result.Schedule.NextDueAt.Equal(command.Schedule.RunAt) {
+				t.Fatalf("active edit lost original misfire position: %#v err=%v", result, err)
 			}
 			planner, _ := application.NewPlanner(store, clock, recurrence.NewCalculator(), "resume-planner", time.Minute, 10)
 			if err := planner.Run(ctx); err != nil {
@@ -2237,5 +2281,175 @@ func TestPostgresOnceHTTPCurrentAndOriginalReceiptRemainDistinct(t *testing.T) {
 	status, invalid, _ := call(http.MethodPost, body, "req-past-new", "http-new-key")
 	if status != 400 {
 		t.Fatalf("new past input=%d %s", status, invalid)
+	}
+	editBody := `{"run_at":"2026-01-01T00:01:00Z","url":"http://service.test/command","paused":true,"body":{"revision":2}}`
+	status, edit, _ := call(http.MethodPut, editBody, "req-edit-once", "http-edit-once")
+	if status != 200 || !strings.Contains(edit, `"next_due_at":null`) || !strings.Contains(edit, `"paused":false`) || !strings.Contains(edit, `"status":"updated"`) {
+		t.Fatalf("consumed edit=%d %s", status, edit)
+	}
+	status, conflict, _ := call(http.MethodPut, strings.Replace(editBody, `"revision":2`, `"revision":3`, 1), "req-conflicting-edit", "http-edit-once")
+	if status != 409 || !strings.Contains(conflict, `"idempotency_conflict"`) {
+		t.Fatalf("changed body reused key=%d %s", status, conflict)
+	}
+	status, invalid, _ = call(http.MethodPut, strings.Replace(editBody, "00:01:00Z", "00:01:01Z", 1), "req-different-past", "http-different-past")
+	if status != 400 {
+		t.Fatalf("new past trigger=%d %s", status, invalid)
+	}
+	status, replay, _ = call(http.MethodPost, body, "req-original-again", "http-once-create")
+	if status != 200 || replay != original {
+		t.Fatal("new edit changed original ACK")
+	}
+}
+
+// Hold a real transaction after its read, without taking the schedule row lock.
+// A competing commit must invalidate that read rather than be silently overwritten.
+type replaceReadGateStore struct {
+	ports.Store
+	read, release chan struct{}
+}
+
+func (s *replaceReadGateStore) WithinTx(ctx context.Context, work func(ports.TxStore) error) error {
+	return s.Store.WithinTx(ctx, func(tx ports.TxStore) error {
+		return work(&replaceReadGateTx{TxStore: tx, read: s.read, release: s.release})
+	})
+}
+
+type replaceReadGateTx struct {
+	ports.TxStore
+	read, release chan struct{}
+}
+
+func (s *replaceReadGateTx) GetSchedule(ctx context.Context, tenant, name string) (domain.Schedule, error) {
+	current, err := s.TxStore.GetSchedule(ctx, tenant, name)
+	if err != nil {
+		return domain.Schedule{}, err
+	}
+	close(s.read)
+	select {
+	case <-s.release:
+		return current, nil
+	case <-ctx.Done():
+		return domain.Schedule{}, ctx.Err()
+	}
+}
+
+func TestPostgresOnceReplaceFencesConcurrentConsumptionAndIdentity(t *testing.T) {
+	for _, winner := range []string{"planner", "replace", "delete-recreate", "delete", "cancel"} {
+		t.Run(winner, func(t *testing.T) {
+			store, pool := openIntegrationStore(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			clock := doubles.NewClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+			service, _ := application.NewService(store, clock, recurrence.NewCalculator())
+			create := createCommand("tenant-a", "once-race", "race-create", "req-race")
+			create.Schedule.Rule = ""
+			create.Schedule.RunAt = clock.Now().Add(time.Minute)
+			if _, err := service.Execute(ctx, create); err != nil {
+				t.Fatal(err)
+			}
+			clock.Advance(time.Minute)
+			gate := &replaceReadGateStore{Store: store, read: make(chan struct{}), release: make(chan struct{})}
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(gate.release) }) }
+			defer release()
+			staleService, _ := application.NewService(gate, clock, recurrence.NewCalculator())
+			edit := create
+			edit.Operation = domain.CommandUpdate
+			edit.CommandScope = "PUT:once-race"
+			edit.IdempotencyKey = "stale-replace"
+			edit.Schedule.Payload = []byte(`{"writer":"stale"}`)
+			type outcome struct {
+				receipt domain.CommandReceipt
+				err     error
+			}
+			done := make(chan outcome, 1)
+			go func() {
+				receipt, err := staleService.Execute(ctx, edit)
+				done <- outcome{receipt, err}
+			}()
+			select {
+			case <-gate.read:
+			case result := <-done:
+				t.Fatalf("replace failed before current read: %v", result.err)
+			case <-ctx.Done():
+				t.Fatal("current-read gate timed out")
+			}
+			planner, _ := application.NewPlanner(store, clock, recurrence.NewCalculator(), "race-planner", time.Minute, 10)
+			switch winner {
+			case "planner":
+				if err := planner.Run(ctx); err != nil {
+					t.Fatal(err)
+				}
+			case "replace":
+				other := edit
+				other.IdempotencyKey = "winning-replace"
+				other.Schedule.Payload = []byte(`{"writer":"winner"}`)
+				if _, err := service.Execute(ctx, other); err != nil {
+					t.Fatal(err)
+				}
+			case "delete-recreate", "delete":
+				remove := create
+				remove.Operation = domain.CommandDelete
+				remove.CommandScope = "DELETE:once-race"
+				remove.IdempotencyKey = "race-delete"
+				if _, err := service.Execute(ctx, remove); err != nil {
+					t.Fatal(err)
+				}
+				if winner == "delete-recreate" {
+					create.IdempotencyKey = "race-recreate"
+					create.Schedule.RunAt = clock.Now().Add(time.Hour)
+					if _, err := service.Execute(ctx, create); err != nil {
+						t.Fatal(err)
+					}
+				}
+			case "cancel":
+				cancel()
+			}
+			release()
+			var result outcome
+			select {
+			case result = <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("replace did not settle")
+			}
+			if winner == "cancel" {
+				if !errors.Is(result.err, context.Canceled) {
+					t.Fatalf("cancel err=%v", result.err)
+				}
+				var receipts int
+				if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM scheduler_command_receipt WHERE idempotency_key='stale-replace'`).Scan(&receipts); err != nil || receipts != 0 {
+					t.Fatalf("cancelled command persisted receipt: count=%d err=%v", receipts, err)
+				}
+				current, err := service.Get(context.Background(), "tenant-a", "once-race")
+				if err != nil || current.Version != 1 || current.Status != domain.ScheduleActive || !current.NextDueAt.Equal(create.Schedule.RunAt) {
+					t.Fatalf("cancelled command changed current: %#v err=%v", current, err)
+				}
+			} else {
+				want := domain.ResultChanged
+				if winner == "delete" {
+					want = domain.ResultNotFound
+				}
+				if result.err != nil || result.receipt.Result.Code != want {
+					t.Fatalf("stale replace=%#v err=%v", result.receipt, result.err)
+				}
+				replay, err := service.Execute(context.Background(), edit)
+				if err != nil || replay.Result.Code != want {
+					t.Fatalf("conflict replay=%#v err=%v", replay, err)
+				}
+			}
+			var staleWrites int
+			if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM scheduler_schedule WHERE payload->>'writer'='stale'`).Scan(&staleWrites); err != nil || staleWrites != 0 {
+				t.Fatalf("stale writes=%d err=%v", staleWrites, err)
+			}
+			if winner == "replace" {
+				if err := planner.Run(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				var payload string
+				if err := pool.QueryRow(context.Background(), `SELECT payload->>'writer' FROM scheduler_dispatch_outbox`).Scan(&payload); err != nil || payload != "winner" {
+					t.Fatalf("queued payload=%s err=%v", payload, err)
+				}
+			}
+		})
 	}
 }

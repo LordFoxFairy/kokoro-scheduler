@@ -1,3 +1,15 @@
+## 2026-10-18 3.0 实现保持唯一四表
+
+当前候选仅查询原行并以原id/version UPDATE、保消费位置及nullable next，沿原事务写新receipt。canonical SQL完全不变，已物化occurrence/outbox与旧receipt不升级/重写，不增加任何持久映射。源码竞争/取消与实际PG回滚证据由CURRENT记录；无正常库操作。
+
+## 2026-10-18 同触发源编辑确认：沿现四表
+
+用户确认下文候选语义，无Schema变化。replace在同一owner事务读取原行并按id/version CAS更新定义，精确同run_at保消费位置；exhausted仍SQL NULL next，不写零Go时间、不改旧执行/receipt。Planner先提交则旧replace冲突，replace先提交则旧claim/version不可推进；同名重建的新id同样受围栏保护。正常库不演进；源码/契约和隔离并发验收仍待执行。
+
+## 2026-10-18 到期 once 编辑候选：无新增持久事实
+
+当前schema已能保存once的run_at、exhausted/null next、id/version与原receipt；候选同触发源编辑不需新增表、缓存或BFF来源映射。后继如确认，仍在本owner同client事务读取原schedule、以原id/version更新及插receipt，保耗尽/消费位置，清旧claim；不修改既有occurrence/dispatch payload/历史receipt。具体API/实现尚待确认及隔离验证，正常库和现canonical SQL本轮不改。
+
 ## 2026-10-18 一次性触发与有限耗尽
 
 唯一canonical database/schema.sql中仅改scheduler_schedule：schedule_rule改nullable，新增run_at TIMESTAMPTZ(3)，next_due_at改nullable，status扩exhausted。CHECK保证rule非空且run_at空，或rule空且run_at非空（二选一）；exhausted仅用于once，next必须NULL且无claim；active/paused的next非空，once next必须等于run_at。paused无claim；现有唯一身份、tenant和retry约束保持。其余三表定义/历史不变。

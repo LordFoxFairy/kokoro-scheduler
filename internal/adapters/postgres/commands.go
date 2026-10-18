@@ -83,7 +83,7 @@ func (s *txStore) CreateSchedule(ctx context.Context, schedule domain.Schedule) 
 	return created, err
 }
 
-func (s *txStore) UpdateSchedule(ctx context.Context, schedule domain.Schedule) (domain.Schedule, error) {
+func (s *txStore) UpdateSchedule(ctx context.Context, current, schedule domain.Schedule) (domain.Schedule, error) {
 	query := `
         UPDATE scheduler_schedule
            SET schedule_rule = $3, timezone = $4, target_url = $5, target_method = $6,
@@ -92,17 +92,20 @@ func (s *txStore) UpdateSchedule(ctx context.Context, schedule domain.Schedule) 
                retry_max_backoff_seconds = $14, retry_window_seconds = $15,
                next_due_at = $16, claim_owner = NULL, claim_expires_at = NULL,
                version = version + 1, updated_at = $17, run_at = $18
-         WHERE tenant_id = $1 AND name = $2
+         WHERE tenant_id = $1 AND name = $2 AND id = $19::uuid AND version = $20
          RETURNING ` + scheduleColumns
 	updated, err := scanSchedule(s.tx.QueryRow(ctx, query,
 		schedule.TenantID, schedule.Name, nullableString(schedule.Rule), schedule.Timezone,
 		schedule.TargetURL, schedule.Method, schedule.Payload, schedule.Status,
 		schedule.MisfirePolicy, schedule.CatchUpLimit, schedule.OverlapPolicy,
 		schedule.Retry.MaxAttempts, schedule.Retry.BackoffSeconds, schedule.Retry.MaxBackoffSeconds,
-		schedule.Retry.MaxRetryWindowSeconds, schedule.NextDueAt, schedule.UpdatedAt, nullableInstant(schedule.RunAt),
+		schedule.Retry.MaxRetryWindowSeconds, nullableInstant(schedule.NextDueAt), schedule.UpdatedAt, nullableInstant(schedule.RunAt), current.ID, current.Version,
 	))
 	if errors.Is(err, pgx.ErrNoRows) {
-		return domain.Schedule{}, domain.ErrScheduleNotFound
+		if _, readErr := s.GetSchedule(ctx, current.TenantID, current.Name); readErr != nil {
+			return domain.Schedule{}, readErr
+		}
+		return domain.Schedule{}, domain.ErrScheduleChanged
 	}
 	return updated, err
 }

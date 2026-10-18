@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Kokoro Scheduler Internal API",
-    "version": "2.0.0",
+    "version": "3.0.0",
     "description": "Tenant-scoped durable schedule commands. PostgreSQL command receipts provide exact idempotent replay."
   },
   "servers": [
@@ -169,13 +169,17 @@
         "x-kokoro-control-error-codes": {
           "404": [
             "schedule_not_found"
+          ],
+          "409": [
+            "schedule_changed"
           ]
         },
         "parameters": [
           {
             "$ref": "#/components/parameters/IdempotencyKey"
           }
-        ]
+        ],
+        "description": "Replace with the exact same nonzero run_at preserves the original due and exhaustion. Exhausted overrides requested paused; changing the trigger requires a future instant. A concurrent identity/version change returns durable 409 schedule_changed; old occurrences and receipts are not rewritten."
       },
       "delete": {
         "operationId": "deleteSchedule",
@@ -664,7 +668,7 @@
             "format": "date-time",
             "maxLength": 24,
             "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,3})?Z$",
-            "description": "Absolute one-time UTC instant at millisecond precision. Must be future for a new create/replace; an original durable receipt replays unchanged after due."
+            "description": "Absolute one-time UTC instant at millisecond precision. Create or changing the trigger requires a future instant; replace with the exact same nonzero run_at preserves its due/consumed position. An original durable receipt replays unchanged after due."
           }
         },
         "oneOf": [
@@ -771,10 +775,13 @@
             "format": "uuid"
           },
           "next_due_at": {
-            "type": "string",
+            "type": [
+              "string",
+              "null"
+            ],
             "format": "date-time",
             "pattern": "Z$",
-            "description": "RFC 3339 UTC instant."
+            "description": "Original command result next instant; null only for a consumed once trigger. Not current state or target execution success."
           },
           "version": {
             "type": "integer",
@@ -785,7 +792,7 @@
             "format": "date-time",
             "maxLength": 24,
             "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,3})?Z$",
-            "description": "Absolute one-time UTC instant at millisecond precision. Must be future for a new create/replace; an original durable receipt replays unchanged after due."
+            "description": "Absolute one-time UTC instant at millisecond precision. Create or changing the trigger requires a future instant; replace with the exact same nonzero run_at preserves its due/consumed position. An original durable receipt replays unchanged after due."
           }
         },
         "oneOf": [
@@ -798,6 +805,30 @@
             "required": [
               "run_at"
             ]
+          }
+        ],
+        "allOf": [
+          {
+            "if": {
+              "required": [
+                "next_due_at"
+              ],
+              "properties": {
+                "next_due_at": {
+                  "type": "null"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "run_at"
+              ],
+              "properties": {
+                "paused": {
+                  "const": false
+                }
+              }
+            }
           }
         ]
       },
@@ -1178,7 +1209,7 @@
             "format": "date-time",
             "maxLength": 24,
             "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,3})?Z$",
-            "description": "Absolute one-time UTC instant at millisecond precision. Must be future for a new create/replace; an original durable receipt replays unchanged after due."
+            "description": "Absolute one-time UTC instant at millisecond precision. Create or changing the trigger requires a future instant; replace with the exact same nonzero run_at preserves its due/consumed position. An original durable receipt replays unchanged after due."
           }
         },
         "oneOf": [

@@ -1,3 +1,21 @@
+## 2026-10-18 同触发源编辑：3.0 源码候选已实现
+
+基线8a26c91，同需求分支。已将同非零run_at的replace改为保原due/exhausted，新增当前id/version CAS与SQL nullable next；不同触发源/新建仍future，原receipt先重放、旧执行不改。canonical/manifest/breaking policy配对3.0.0：mutation next允许条件null、保原字段集，replace新增明确409 schedule_changed。本片为本地producer候选，后继BFF仍固定2.0 producer，不能正常激活或声称整链完成。
+
+原PG用例增强同源耗尽编辑、真实提交丢ACK、clock回拨不复活、paused/active过due保原位置、HTTP null ACK/原ACK和不同past拒绝；新增一项真实PG竞争表覆盖planner/replace/delete-recreate/delete/cancel。隔离暂去CAS围栏时planner/replace/ABA三个子项真实失败，已逐字恢复；不是编译/缺资源失败。65个非Markdown工程输入停写后，主方gofmt、vet、默认test、build、contract-check和diff均exit0；默认含子项216 PASS/37资源SKIP，另自有fresh PostgreSQL完整integration与源码重启smoke共63项（含子项）PASS/0 SKIP。schema及数据库均清理；独立只读复核未发现确定P0–P2。默认资源SKIP不计通过，资源证据来自独立真实门。正常库/服务和任务不动；模型/真实工具、扣费、CI、远端暂停。下文“尚未改机器契约/待确认”为历史阶段。
+
+## 2026-10-18 同触发源编辑语义已确认，待正式实现
+
+用户确认下文候选B：同一非零run_at编辑保留原due与耗尽位置，exhausted优先于请求paused，改到新的未来时间才重新排期。此确认取代下文“协议待确认”，不是源码/机器契约已完成。下一片先配对三设计面与breaking mutation ACK，再实现同事务读取、id/version CAS和nullableInstant，补真实PG竞争/回执证据；正常服务/库和任务仍不动。BFF锁内同触发源past校验、ACK/current matcher与固定SDK后继原子配对，不保旧revision旁路。
+
+## 2026-10-18 同一次触发的到期编辑缺口（已复现，协议待确认）
+
+主方使用干净8a26c91源码、固定BFF control client及自有fresh数据库实测：创建未来paused once后，实际等到run_at过去，同一run_at且仅body.task_revision改为2的全新replace得到400/invalid_schedule，而预期管理语义是允许编辑且不重新触发。原current仍paused/revision1，1 schedule/1 receipt/0 occurrence/0 dispatch；旧创建ACK原样重放仍成功。诊断进程exit0、自有库已清理，未改正常环境、Schema、角色、积分或启模型/工具。私有诊断以预期200与实际400明确exit1，不计通过，也不以paused案例冒exhausted/并发已验。
+
+根因已核：application在读既有schedule前拒绝所有past update；PG blind tenant/name UPDATE本来也会重置status/next。BFF若在terminal状态跳过写入，将需保存旧callback revision与完整来源链；更简洁候选是由通用Scheduler在同run_at更新时保留消费位置，继续写最新opaque正文，不引入BFF业务概念。只读交叉复核同意此放置。
+
+这是现2.0之外的待决协议演进：原mutation ACK要求next非空，保留exhausted将需要正式nullable/终态ACK与BFF consumer配对；更新还需原id/version围栏，保planner/删除重建竞态及同事务receipt。已向用户确认“同次触发编辑不重启，改变为新的未来时间才重新排期”的产品语义；本段不代替确认，不改机器契约或实现。现有future-only代码/正常旧binary保持，完整周期、Agent定时MCP和goal仍未完成；远端、模型、实际工具、扣费及CI继续暂停。
+
 ## 2026-10-18 Generic once producer（本地验证完成，消费者/正常激活待接）
 
 沿原e8dca48与已验current GET切片，现同需求分支实现rule/run_at XOR、未来UTC毫秒instant、once耗尽与current null next；不引入业务frequency/项目/MCP凭据。occurrence/outbox/耗尽/claim/version同事务，原key到点后仍重放原ACK，pause/resume采用id+version CAS且不复活exhausted，旧三事实表定义逐字不变。canonical contract升2.0.0，错误登记按status列出代码数组（pause/resume的409含exhausted/changed）；无兼容alias或新依赖。
