@@ -28,20 +28,22 @@ func TestOpenAPIControlOperationsHaveRuntimeRouteParity(t *testing.T) {
 			}
 			continue
 		}
-		for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {
+		for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete} {
 			if _, declared := item[strings.ToLower(method)]; !declared {
 				continue
 			}
 			runtimePath := strings.Replace(path, "{name}", "contract.parity", 1)
 			body := ""
-			if !strings.HasSuffix(runtimePath, "/pause") && !strings.HasSuffix(runtimePath, "/resume") && method != http.MethodDelete {
+			if !strings.HasSuffix(runtimePath, "/pause") && !strings.HasSuffix(runtimePath, "/resume") && method != http.MethodDelete && method != http.MethodGet {
 				body = `{"schedule":"@every 1m","timezone":"UTC","url":"http://service.test/command","misfire_policy":"fire_once","overlap_policy":"forbid"}`
 			}
 			request := httptest.NewRequest(method, runtimePath, strings.NewReader(body))
 			request.Header.Set("Authorization", "Bearer contract-token")
 			request.Header.Set("X-Kokoro-Tenant-Id", "tenant-contract")
 			request.Header.Set("X-Request-Id", "request-contract-"+strings.ToLower(method))
-			request.Header.Set("Idempotency-Key", "key-contract-"+strings.ToLower(method)+runtimePath)
+			if method != http.MethodGet {
+				request.Header.Set("Idempotency-Key", "key-contract-"+strings.ToLower(method)+runtimePath)
+			}
 			if body != "" {
 				request.Header.Set("Content-Type", "application/json")
 			}
@@ -107,6 +109,12 @@ func (s *parityService) Execute(_ context.Context, command application.Command) 
 		result.Schedule = &schedule
 	}
 	return domain.CommandReceipt{RequestID: command.RequestID, Result: result}, nil
+}
+
+func (s *parityService) Get(_ context.Context, tenant, name string) (domain.Schedule, error) {
+	return (domain.Schedule{ID: "00000000-0000-0000-0000-000000000001", TenantID: tenant, Name: name,
+		Rule: "@every 1m", TargetURL: "http://service.test/command", Version: 1,
+		NextDueAt: time.Date(2026, 1, 1, 0, 1, 0, 0, time.UTC)}).Normalized()
 }
 
 func (s *parityService) snapshot() []application.Command {

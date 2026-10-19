@@ -1,3 +1,31 @@
+## 2026-10-18 3.0.0 候选机器契约
+
+下文确认门已配对canonical/manifest/policy及运行语义。Schedule.next_due_at为string|null；条件null必须run_at存在且paused=false，不增加status字段到mutation ACK。CurrentSchedule仍明确lifecycle；mutation的data.status仍是命令结果。replace新增durable409 schedule_changed。3.0.0是本地候选，BFF未固定消费前禁止正常组合切换；不改历史receipt或返回其合成新状态。
+
+## 2026-10-18 同触发源编辑：已确认契约演进门
+
+用户确认同一once run_at编辑不复活、仅新未来run_at重排。目标breaking后继保mutation字段集合与data.status命令结果，Schedule.next_due_at改string|null，并约束仅带run_at的已耗尽once可为null；paused=false反映耗尽优先，不把它误判为重新active。当前GET继续拥有真实lifecycle。replace发生原id/version变化时返回durable409 schedule_changed；旧receipt原ACK保留、不强加新required status或改历史JSON。canonical版本、breaking policy/manifest/digest、HTTP parity和固定BFF consumer必须一同配对；本次仅记录确认，现2.0机器文件尚未改。下文“待确认”已被本节取代。
+
+## 2026-10-18 到期 once 编辑候选（未变更现2.0机器契约）
+
+现run_at新create/replace必须未来，旧receipt仍可在到点后原样重放；已真实复现同instant到期后仅改body也400。候选语义为同once触发源编辑保原消费位置，exhausted不重排，改变为新未来instant才产生新触发；须产品确认后再正规演进。当前Schedule mutation ACK的required next_due_at:string不能表达耗尽编辑，后继必须明确nullable/终态联合约束与版本、manifest/parity/固定消费者一起升级，保旧已存receipt，不提前修改canonical或给旧consumer加容错。BFF Public17本轮不为此新增业务字段。
+
+## 2026-10-18 通用 once／exhausted（目标 2.0.0）
+
+ScheduleInput严格接受schedule或run_at恰一字段，拒both/neither/null/empty；run_at为RFC3339 UTC Z、毫秒精度、首次创建/完整替换时须未来。timezone仍显式IANA（缺省UTC），但once以绝对run_at为准，不再按其换算日历。无需业务frequency/星期/项目字段。未来检查发生在原receipt重放之后，同key同body在到点后仍返回首次ACK；不同body仍409 idempotency_conflict。
+
+mutation Schedule为recurring的schedule或once的run_at二选一；其他旧字段保持，旧recurring digest/ACK不因新字段改变。当前GET增加status=exhausted，并且只有exhausted的next_due_at为null；active/paused仍为非空instant。exhausted不是目标成功，读取不合并工具/Agent结果。pause/resume已耗尽任务409 schedule_exhausted（durable receipt）；resume并发version变化409 schedule_changed，使用新命令决定后续动作。DELETE与旧执行/回执保留行为不变。
+
+版本2.0.0显式声明输入/输出条件形状与nullable current next变化；机器错误登记按HTTP状态保存代码数组，明确409的exhausted与changed而非漏列并发结果。BFF generated artifact/pin和业务消费必须后继配对，不修改现旧consumer作fallback，不在正常环境提前启用。既有GET无body/query/no-store及tenant/service认证不变。
+
+## 2026-10-18 当前 Schedule GET（契约 1.1.0）
+
+`GET /internal/scheduler/v1/schedules/{name}` 使用既有 service Bearer、X-Kokoro-Tenant-Id、X-Request-Id；没有请求 body/query，也不需要 Idempotency-Key。返回 `data.schedule`，结构为原 Schedule 加当前 `status: active|paused`；当前阶段 next_due_at 仍为 UTC 非空 instant，paused 保留已存 next，不表示正在执行。响应 X-Request-Id 对应该次读取，Cache-Control=no-store；新 GET 不在 JSON 中复制 request ID。
+
+400：现 request/tenant 校验，以及 invalid_schedule_read（body/query）；401 service_auth_failed；404 schedule_not_found（同租户缺失与其他租户统一）；500 scheduler_read_failed。存储/取消错误不泄漏内部诊断；所有 GET 响应 no-store。GET 不接受 action 路径、不创建 command receipt。
+
+POST/PUT/DELETE/pause/resume 原 wire、状态码及不可变 receipt 原样保留，首次 ACK 不是当前状态查询。canonical OpenAPI 是唯一可编辑机器事实；manifest 同步版本/digest，runtime parity 纳入 GET。本切片没有 once/exhausted/null next，未升级消费者或正常环境。
+
 ## R45-WIN09：真实首轮在 fixture 阶段失败（2026-10-01）
 
 Root PG 首轮 **18 PASS / 6 FAIL（24 顶层，1.388s）**；六个新资源用例尚未到 reader/比较/分类/取消断言，失败是四表 sentinel 未完整准备，不是 missing callable 或 catalog 行为 RED。日志 `/tmp/kokoro-scheduler-catalog-r45-root-resource.log`。

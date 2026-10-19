@@ -104,6 +104,15 @@ func planSchedule(schedule domain.Schedule, now time.Time, recurrence ports.Recu
 	if due.IsZero() || due.After(now) {
 		return nil, due, nil
 	}
+	if !schedule.RunAt.IsZero() {
+		plan := dispatchPlan(due, now)
+		if due.Before(now) && schedule.MisfirePolicy == domain.MisfireSkip {
+			plan.Dispatch = false
+			plan.Status = domain.OccurrenceSkipped
+			plan.OutcomeCode = domain.CodeMisfireSkipped
+		}
+		return []domain.OccurrencePlan{plan}, time.Time{}, nil
+	}
 	if due.Equal(now) {
 		next, err := recurrence.Next(schedule.Rule, schedule.Timezone, due)
 		return []domain.OccurrencePlan{dispatchPlan(due, now)}, next, err

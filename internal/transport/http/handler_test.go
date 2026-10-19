@@ -50,6 +50,9 @@ func (s *stubCommandService) Execute(_ context.Context, command application.Comm
 		schedule.ID = "00000000-0000-0000-0000-000000000001"
 		schedule.Version = 1
 		schedule.NextDueAt = time.Date(2026, 1, 2, 3, 5, 0, 0, time.UTC)
+		if !schedule.RunAt.IsZero() {
+			schedule.NextDueAt = schedule.RunAt
+		}
 		result.Schedule = &schedule
 	case domain.CommandUpdate:
 		result.Code = domain.ResultUpdated
@@ -73,6 +76,10 @@ func (s *stubCommandService) Execute(_ context.Context, command application.Comm
 	}
 	s.receipts[identity] = receipt
 	return receipt, nil
+}
+
+func (s *stubCommandService) Get(context.Context, string, string) (domain.Schedule, error) {
+	return domain.Schedule{}, domain.ErrScheduleNotFound
 }
 
 func (s *stubCommandService) lastCommand() application.Command {
@@ -104,6 +111,10 @@ func TestHandlerUsesDurableCommandReceiptAcrossHandlerReconstruction(t *testing.
 		t.Fatalf("first status=%d body=%s", first.Code, first.Body.String())
 	}
 	command := service.lastCommand()
+	// Stable digest from the pre-once recurring contract; adding run_at must not invalidate old receipts.
+	if command.RequestDigest != "sha256:bd315f0a8fc6595210e77f61c11b0aeec49d034c1ebf009d24177936803ab513" {
+		t.Fatalf("recurring receipt digest changed: %s", command.RequestDigest)
+	}
 	if command.TenantID != "tenant-a" || command.Name != "billing.reconcile" || command.Schedule.Timezone != "America/New_York" {
 		t.Fatalf("application command = %#v", command)
 	}
@@ -141,6 +152,7 @@ func TestHandlerMapsStableControlResultsToCanonicalErrors(t *testing.T) {
 	tests := []struct {
 		name       string
 		method     string
+		action     string
 		resultCode string
 		wantStatus int
 		wantCode   string
@@ -160,14 +172,20 @@ func TestHandlerMapsStableControlResultsToCanonicalErrors(t *testing.T) {
 			name: "missing delete", method: http.MethodDelete, resultCode: domain.ResultNotFound,
 			wantStatus: http.StatusNotFound, wantCode: "schedule_not_found",
 		},
+		{name: "exhausted pause", method: http.MethodPost, action: "pause", resultCode: domain.ResultExhausted, wantStatus: 409, wantCode: "schedule_exhausted"},
+		{name: "changed resume", method: http.MethodPost, action: "resume", resultCode: domain.ResultChanged, wantStatus: 409, wantCode: "schedule_changed"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			service := newStubCommandService()
-			service.resultCodeByOperation[operationFor(test.method, "")] = test.resultCode
+			service.resultCodeByOperation[operationFor(test.method, test.action)] = test.resultCode
+			path := SchedulesPathPrefix + "billing.reconcile"
+			if test.action != "" {
+				path += "/" + test.action
+			}
 			response := httptest.NewRecorder()
 			NewHTTPHandler(service, testToken, nil).ServeHTTP(response, internalRequest(
-				test.method, SchedulesPathPrefix+"billing.reconcile", test.body,
+				test.method, path, test.body,
 				"req-control-result", "control-result-key", "tenant-a",
 			))
 			if response.Code != test.wantStatus {
@@ -301,3 +319,172 @@ func TestHandlerReadinessFailsClosedWhenDependencyIsUnavailable(t *testing.T) {
 }
 
 var _ CommandService = (*stubCommandService)(nil)
+
+// A query must bypass Execute: command receipts remain frozen even when the row advances.
+type currentScheduleService struct {
+	*stubCommandService
+	read func(context.Context, string, string) (domain.Schedule, error)
+}
+
+func (s *currentScheduleService) Get(ctx context.Context, tenant, name string) (domain.Schedule, error) {
+	return s.read(ctx, tenant, name)
+}
+
+func TestHandlerReadsCurrentScheduleWithoutCommandIdentity(t *testing.T) {
+	reads := 0
+	service := &currentScheduleService{stubCommandService: newStubCommandService()}
+	service.read = func(ctx context.Context, tenant, name string) (domain.Schedule, error) {
+		reads++
+		if tenant != "tenant-a" || name != "current" || ctx.Err() != nil {
+			t.Fatalf("query context: tenant=%q name=%q err=%v", tenant, name, ctx.Err())
+		}
+		return domain.Schedule{ID: "schedule-id", Name: name, Status: domain.SchedulePaused,
+			Rule: "@every 1m", Timezone: "UTC", Payload: []byte(`{}`), Version: 9,
+			NextDueAt: time.Date(2026, 1, 1, 0, 6, 0, 0, time.UTC)}, nil
+	}
+	handler := NewHTTPHandler(service, testToken, nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, internalRequest(http.MethodGet, SchedulesPathPrefix+"current", "", "req-current", "", "tenant-a"))
+	if response.Code != http.StatusOK {
+		t.Fatalf("query status=%d body=%s", response.Code, response.Body.String())
+	}
+	var result struct {
+		Data struct {
+			Schedule struct {
+				Status    string `json:"status"`
+				Paused    bool   `json:"paused"`
+				NextDueAt string `json:"next_due_at"`
+				Version   int64  `json:"version"`
+			} `json:"schedule"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	got := result.Data.Schedule
+	if got.Status != "paused" || !got.Paused || got.NextDueAt != "2026-01-01T00:06:00Z" || got.Version != 9 {
+		t.Fatalf("current row = %#v", got)
+	}
+	if response.Header().Get(requestIDHeader) != "req-current" || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("query headers = %v", response.Header())
+	}
+	if reads != 1 || len(service.commands) != 0 || len(service.receipts) != 0 {
+		t.Fatalf("reads=%d writes=%d receipts=%d", reads, len(service.commands), len(service.receipts))
+	}
+}
+
+func TestHandlerCurrentScheduleValidatesBeforeReading(t *testing.T) {
+	for _, tc := range []struct {
+		name, path, body, tenant, requestID, auth string
+		want                                      int
+	}{
+		{"unauthenticated", "current", "", "tenant-a", "req-read", "", 401},
+		{"tenant missing", "current", "", "", "req-read", "Bearer " + testToken, 400},
+		{"request missing", "current", "", "tenant-a", "", "Bearer " + testToken, 400},
+		{"query", "current?tenant_id=other", "", "tenant-a", "req-read", "Bearer " + testToken, 400},
+		{"body", "current", `{}`, "tenant-a", "req-read", "Bearer " + testToken, 400},
+		{"action", "current/pause", "", "tenant-a", "req-read", "Bearer " + testToken, 405},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service := &currentScheduleService{stubCommandService: newStubCommandService(), read: func(context.Context, string, string) (domain.Schedule, error) {
+				t.Fatal("invalid query reached store")
+				return domain.Schedule{}, nil
+			}}
+			request := internalRequest(http.MethodGet, SchedulesPathPrefix+tc.path, tc.body, tc.requestID, "", tc.tenant)
+			request.Header.Set("Authorization", tc.auth)
+			// Unknown-length bodies must not bypass validation either.
+			request.ContentLength = -1
+			response := httptest.NewRecorder()
+			NewHTTPHandler(service, testToken, nil).ServeHTTP(response, request)
+			if response.Code != tc.want {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if response.Header().Get("Cache-Control") != "no-store" {
+				t.Fatal("GET response may be cached")
+			}
+			if len(service.commands) != 0 {
+				t.Fatal("query executed a command")
+			}
+		})
+	}
+}
+
+func TestHandlerCurrentScheduleErrorsAndCancellation(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		err    error
+		status int
+		code   string
+	}{
+		{"missing or foreign", domain.ErrScheduleNotFound, 404, "schedule_not_found"},
+		{"storage", errors.New("private storage diagnostic"), 500, "scheduler_read_failed"},
+		{"cancelled", context.Canceled, 500, "scheduler_read_failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			service := &currentScheduleService{stubCommandService: newStubCommandService(), read: func(got context.Context, _, _ string) (domain.Schedule, error) {
+				if got.Err() != context.Canceled {
+					t.Fatal("request cancellation was lost")
+				}
+				return domain.Schedule{}, tc.err
+			}}
+			response := httptest.NewRecorder()
+			request := internalRequest(http.MethodGet, SchedulesPathPrefix+"current", "", "req-read", "", "tenant-a").WithContext(ctx)
+			NewHTTPHandler(service, testToken, nil).ServeHTTP(response, request)
+			if response.Code != tc.status || !strings.Contains(response.Body.String(), `"code":"`+tc.code+`"`) || strings.Contains(response.Body.String(), "private storage") {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestHandlerAcceptsExclusiveAbsoluteOnceTrigger(t *testing.T) {
+	for _, tc := range []struct {
+		name, trigger string
+		want          int
+	}{
+		{"once", `"run_at":"2026-11-01T05:30:00.123Z"`, 200},
+		{"both", `"schedule":"@daily","run_at":"2026-11-01T05:30:00Z"`, 400},
+		{"neither", `"timezone":"UTC"`, 400},
+		{"null", `"run_at":null`, 400},
+		{"empty", `"run_at":""`, 400},
+		{"local time", `"run_at":"2026-11-01T01:30:00"`, 400},
+		{"offset", `"run_at":"2026-11-01T01:30:00-04:00"`, 400},
+		{"short hour", `"run_at":"2026-11-01T5:30:00Z"`, 400},
+		{"short hour and submillisecond", `"run_at":"2026-11-01T5:30:00.1234Z"`, 400},
+		{"submillisecond", `"run_at":"2026-11-01T05:30:00.1234Z"`, 400},
+		{"empty rule alongside once", `"schedule":"","run_at":"2026-11-01T05:30:00Z"`, 400},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service := newStubCommandService()
+			response := httptest.NewRecorder()
+			NewHTTPHandler(service, testToken, nil).ServeHTTP(response, internalRequest(http.MethodPost, SchedulesPathPrefix+"once", `{`+tc.trigger+`,"url":"http://service.test/command"}`, "req-once", "key-once", "tenant-a"))
+			if response.Code != tc.want {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if tc.want == 200 {
+				if !strings.Contains(response.Body.String(), `"run_at":"2026-11-01T05:30:00.123Z"`) || strings.Contains(response.Body.String(), `"schedule":""`) {
+					t.Fatalf("once wire=%s", response.Body.String())
+				}
+			} else if len(service.commands) != 0 {
+				t.Fatal("invalid trigger reached application")
+			}
+		})
+	}
+}
+
+func TestHandlerCurrentExhaustedHasNullNextNotEmptyTimestamp(t *testing.T) {
+	service := &currentScheduleService{stubCommandService: newStubCommandService(), read: func(context.Context, string, string) (domain.Schedule, error) {
+		s := domain.Schedule{ID: "once-id", Name: "once", Status: domain.ScheduleStatus("exhausted"), Payload: []byte(`{}`), Version: 2}
+		if err := json.Unmarshal([]byte(`{"RunAt":"2026-11-01T05:30:00Z"}`), &s); err != nil {
+			t.Fatal(err)
+		}
+		return s, nil
+	}}
+	response := httptest.NewRecorder()
+	NewHTTPHandler(service, testToken, nil).ServeHTTP(response, internalRequest(http.MethodGet, SchedulesPathPrefix+"once", "", "req-exhausted", "", "tenant-a"))
+	if response.Code != 200 || !strings.Contains(response.Body.String(), `"next_due_at":null`) || !strings.Contains(response.Body.String(), `"status":"exhausted"`) {
+		t.Fatalf("exhausted wire=%s", response.Body.String())
+	}
+}

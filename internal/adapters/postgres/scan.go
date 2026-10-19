@@ -12,7 +12,7 @@ const scheduleColumns = `
     target_url, target_method, payload, status, misfire_policy,
     catch_up_limit, overlap_policy, max_attempts, retry_backoff_seconds,
     retry_max_backoff_seconds, retry_window_seconds, next_due_at, version,
-    created_at, updated_at, claim_owner, claim_expires_at`
+    created_at, updated_at, claim_owner, claim_expires_at, run_at`
 
 const dispatchColumns = `
     id::text, tenant_id, occurrence_id::text, schedule_id::text, schedule_name,
@@ -28,17 +28,28 @@ func scanSchedule(row rowScanner) (domain.Schedule, error) {
 	var schedule domain.Schedule
 	var method, status, misfire, overlap string
 	var payload []byte
+	var rule *string
+	var runAt, nextDueAt *time.Time
 	var claimOwner *string
 	var claimExpiresAt *time.Time
 	err := row.Scan(
-		&schedule.ID, &schedule.TenantID, &schedule.Name, &schedule.Rule, &schedule.Timezone,
+		&schedule.ID, &schedule.TenantID, &schedule.Name, &rule, &schedule.Timezone,
 		&schedule.TargetURL, &method, &payload, &status, &misfire,
 		&schedule.CatchUpLimit, &overlap, &schedule.Retry.MaxAttempts, &schedule.Retry.BackoffSeconds,
-		&schedule.Retry.MaxBackoffSeconds, &schedule.Retry.MaxRetryWindowSeconds, &schedule.NextDueAt, &schedule.Version,
-		&schedule.CreatedAt, &schedule.UpdatedAt, &claimOwner, &claimExpiresAt,
+		&schedule.Retry.MaxBackoffSeconds, &schedule.Retry.MaxRetryWindowSeconds, &nextDueAt, &schedule.Version,
+		&schedule.CreatedAt, &schedule.UpdatedAt, &claimOwner, &claimExpiresAt, &runAt,
 	)
 	if err != nil {
 		return domain.Schedule{}, err
+	}
+	if rule != nil {
+		schedule.Rule = *rule
+	}
+	if runAt != nil {
+		schedule.RunAt = domain.NormalizeInstant(*runAt)
+	}
+	if nextDueAt != nil {
+		schedule.NextDueAt = domain.NormalizeInstant(*nextDueAt)
 	}
 	schedule.Method = domain.Method(method)
 	schedule.Payload = append(json.RawMessage(nil), payload...)
@@ -94,4 +105,11 @@ func nullableStatus(status int) any {
 		return nil
 	}
 	return status
+}
+
+func nullableInstant(value time.Time) any {
+	if value.IsZero() {
+		return nil
+	}
+	return domain.NormalizeInstant(value)
 }

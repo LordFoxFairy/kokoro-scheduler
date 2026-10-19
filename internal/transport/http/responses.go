@@ -13,7 +13,8 @@ import (
 type scheduleResponse struct {
 	ID            string          `json:"id"`
 	Name          string          `json:"name"`
-	Schedule      string          `json:"schedule"`
+	Schedule      string          `json:"schedule,omitempty"`
+	RunAt         *string         `json:"run_at,omitempty"`
 	Timezone      string          `json:"timezone"`
 	URL           string          `json:"url"`
 	Method        string          `json:"method"`
@@ -23,8 +24,13 @@ type scheduleResponse struct {
 	CatchUpLimit  int             `json:"catch_up_limit"`
 	OverlapPolicy string          `json:"overlap_policy"`
 	Paused        bool            `json:"paused"`
-	NextDueAt     string          `json:"next_due_at"`
+	NextDueAt     *string         `json:"next_due_at"`
 	Version       int64           `json:"version"`
+}
+
+type currentScheduleResponse struct {
+	scheduleResponse
+	Status string `json:"status"`
 }
 
 type retryResponse struct {
@@ -35,12 +41,17 @@ type retryResponse struct {
 }
 
 func toScheduleResponse(schedule domain.Schedule) scheduleResponse {
-	nextDueAt := ""
+	var nextDueAt, runAt *string
 	if !schedule.NextDueAt.IsZero() {
-		nextDueAt = domain.NormalizeInstant(schedule.NextDueAt).Format(time.RFC3339Nano)
+		value := domain.NormalizeInstant(schedule.NextDueAt).Format(time.RFC3339Nano)
+		nextDueAt = &value
+	}
+	if !schedule.RunAt.IsZero() {
+		value := domain.NormalizeInstant(schedule.RunAt).Format(time.RFC3339Nano)
+		runAt = &value
 	}
 	return scheduleResponse{
-		ID: schedule.ID, Name: schedule.Name, Schedule: schedule.Rule, Timezone: schedule.Timezone,
+		ID: schedule.ID, Name: schedule.Name, Schedule: schedule.Rule, RunAt: runAt, Timezone: schedule.Timezone,
 		URL: schedule.TargetURL, Method: string(schedule.Method), Body: append(json.RawMessage(nil), schedule.Payload...),
 		Retry: retryResponse{
 			MaxAttempts: schedule.Retry.MaxAttempts, BackoffSeconds: schedule.Retry.BackoffSeconds,
@@ -59,6 +70,10 @@ func fingerprint(scope string, payload []byte) string {
 
 func receiptResponse(receipt domain.CommandReceipt) (int, map[string]any) {
 	switch receipt.Result.Code {
+	case domain.ResultExhausted:
+		return http.StatusConflict, errorResponse("schedule_exhausted", "scheduler schedule has no further triggers; replace it explicitly to schedule again", receipt.RequestID)
+	case domain.ResultChanged:
+		return http.StatusConflict, errorResponse("schedule_changed", "scheduler schedule changed during the command", receipt.RequestID)
 	case domain.ResultAlreadyExists:
 		return http.StatusConflict, errorResponse("schedule_already_exists", "scheduler schedule already exists", receipt.RequestID)
 	case domain.ResultNotFound:

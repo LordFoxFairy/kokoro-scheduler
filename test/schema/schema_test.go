@@ -44,7 +44,7 @@ func TestCanonicalSchemaOwnsDurableSchedulerFacts(t *testing.T) {
 		"ix_scheduler_schedule_due",
 		"ix_scheduler_occurrence_tenant_schedule",
 		"ix_scheduler_dispatch_outbox_ready",
-		"check (status in ('active', 'paused'))",
+		"check (status in ('active', 'paused', 'exhausted'))",
 		"check (misfire_policy in ('skip', 'fire_once', 'catch_up_bounded'))",
 	} {
 		if !strings.Contains(schema, required) {

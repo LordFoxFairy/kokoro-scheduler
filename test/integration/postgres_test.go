@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1715,4 +1717,739 @@ func ownedCatalogColumn(t *testing.T, snapshot postgresadapter.SchemaCatalog, ta
 	}
 	t.Fatal("catalog fixture column was not found")
 	return postgresadapter.SchemaCatalogColumn{}
+}
+
+// Real PG plus loopback HTTP: the current row advances independently of the
+// original ACK, while reads leave all four owner facts untouched. No dispatcher.
+func TestPostgresCurrentScheduleReadDoesNotRewriteReceiptsOrPlan(t *testing.T) {
+	store, pool := openIntegrationStore(t)
+	clock := doubles.NewClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	service, err := application.NewService(store, clock, recurrence.NewCalculator())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(transporthttp.NewHTTPHandler(service, "local-test-token", nil))
+	t.Cleanup(server.Close)
+	client := &http.Client{Timeout: 3 * time.Second}
+	path := "/internal/scheduler/v1/schedules/current"
+	body := `{"schedule":"@every 1m","timezone":"UTC","url":"http://service.test/command"}`
+	type response struct {
+		code                   int
+		body, requestID, cache string
+	}
+	request := func(method, suffix, payload, tenant, id, key string) response {
+		t.Helper()
+		req, err := http.NewRequestWithContext(context.Background(), method, server.URL+path+suffix, strings.NewReader(payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer local-test-token")
+		req.Header.Set("X-Kokoro-Tenant-Id", tenant)
+		req.Header.Set("X-Request-Id", id)
+		if key != "" {
+			req.Header.Set("Idempotency-Key", key)
+		}
+		if payload != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		res, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		data, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response{res.StatusCode, string(data), res.Header.Get("X-Request-Id"), res.Header.Get("Cache-Control")}
+	}
+	facts := func() string {
+		t.Helper()
+		var snapshot strings.Builder
+		for _, table := range []string{"scheduler_schedule", "scheduler_command_receipt", "scheduler_occurrence", "scheduler_dispatch_outbox"} {
+			var rows string
+			query := "SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text), '[]'::jsonb)::text FROM " + pgx.Identifier{table}.Sanitize() + " t"
+			if err := pool.QueryRow(context.Background(), query).Scan(&rows); err != nil {
+				t.Fatal(err)
+			}
+			snapshot.WriteString(table + ":" + rows + "\n")
+		}
+		return snapshot.String()
+	}
+	first := request(http.MethodPost, "", body, "tenant-a", "req-original", "create-current")
+	if first.code != 200 || !strings.Contains(first.body, `"next_due_at":"2026-01-01T00:01:00Z"`) {
+		t.Fatalf("create=%#v", first)
+	}
+	clock.Advance(5 * time.Minute)
+	planner, err := application.NewPlanner(store, clock, recurrence.NewCalculator(), "current-query-planner", time.Minute, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := planner.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	checkRead := func(wantStatus string, wantVersion int64) {
+		t.Helper()
+		before := facts()
+		current := request(http.MethodGet, "", "", "tenant-a", "req-current-"+wantStatus, "")
+		if current.code != 200 || current.cache != "no-store" || current.requestID != "req-current-"+wantStatus {
+			t.Fatalf("read=%#v", current)
+		}
+		var result struct {
+			Data struct {
+				Schedule struct {
+					Status    string `json:"status"`
+					NextDueAt string `json:"next_due_at"`
+					Version   int64  `json:"version"`
+				} `json:"schedule"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal([]byte(current.body), &result); err != nil {
+			t.Fatal(err)
+		}
+		got := result.Data.Schedule
+		if got.Status != wantStatus || got.NextDueAt != "2026-01-01T00:06:00Z" || got.Version != wantVersion {
+			t.Fatalf("row=%#v", got)
+		}
+		if foreign := request(http.MethodGet, "", "", "tenant-b", "req-foreign", ""); foreign.code != 404 {
+			t.Fatalf("foreign=%#v", foreign)
+		}
+		if missing := request(http.MethodGet, "-missing", "", "tenant-a", "req-missing", ""); missing.code != 404 {
+			t.Fatalf("missing=%#v", missing)
+		}
+		if after := facts(); after != before {
+			t.Fatal("GET changed owner facts")
+		}
+	}
+	checkRead("active", 2)
+	if paused := request(http.MethodPost, "/pause", "", "tenant-a", "req-pause", "pause-current"); paused.code != 200 {
+		t.Fatalf("pause=%#v", paused)
+	}
+	checkRead("paused", 3)
+	beforeReplay := facts()
+	replay := request(http.MethodPost, "", body, "tenant-a", "req-replay", "create-current")
+	if replay.code != first.code || replay.body != first.body || replay.requestID != first.requestID {
+		t.Fatalf("receipt changed: first=%#v replay=%#v", first, replay)
+	}
+	if after := facts(); after != beforeReplay {
+		t.Fatal("receipt replay changed owner facts")
+	}
+	for _, scope := range []struct{ tenant, name string }{{"", "current"}, {"tenant-a", "../other"}} {
+		if _, err := service.Get(context.Background(), scope.tenant, scope.name); !errors.Is(err, application.ErrInvalidCommand) {
+			t.Fatalf("invalid scope err=%v", err)
+		}
+	}
+}
+
+// This fault is injected after the real PostgreSQL commit, not in place of it.
+type onceLostCommitAckStore struct {
+	ports.Store
+	lose bool
+}
+
+func (s *onceLostCommitAckStore) WithinTx(ctx context.Context, work func(ports.TxStore) error) error {
+	if err := s.Store.WithinTx(ctx, work); err != nil {
+		return err
+	}
+	if s.lose {
+		s.lose = false
+		return errors.New("test lost commit acknowledgement")
+	}
+	return nil
+}
+
+func TestPostgresOnceExhaustsAtomicallyAndReplaysAfterLostCommitAck(t *testing.T) {
+	store, pool := openIntegrationStore(t)
+	ctx := context.Background()
+	clock := doubles.NewClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	fault := &onceLostCommitAckStore{Store: store, lose: true}
+	service, _ := application.NewService(fault, clock, recurrence.NewCalculator())
+	command := createCommand("tenant-a", "once", "once-create", "req-once-create")
+	command.Schedule.Rule = ""
+	command.Schedule.RunAt = clock.Now().Add(time.Minute)
+	command.Schedule.Retry.MaxAttempts = 2
+	if _, err := service.Execute(ctx, command); err == nil {
+		t.Fatal("lost commit acknowledgement should be unknown")
+	}
+	current, err := service.Get(ctx, "tenant-a", "once")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !current.RunAt.Equal(command.Schedule.RunAt) || !current.NextDueAt.Equal(command.Schedule.RunAt) {
+		t.Fatalf("once=%#v", current)
+	}
+	var originalBody string
+	if err := pool.QueryRow(ctx, "SELECT result_body::text FROM scheduler_command_receipt WHERE idempotency_key='once-create'").Scan(&originalBody); err != nil {
+		t.Fatal(err)
+	}
+	// Canonical constraints independently reject invalid persisted states.
+	for _, sql := range []string{
+		"UPDATE scheduler_schedule SET schedule_rule='@daily' WHERE name='once'",
+		"UPDATE scheduler_schedule SET run_at=NULL WHERE name='once'",
+		"UPDATE scheduler_schedule SET next_due_at=NULL WHERE name='once'",
+		"UPDATE scheduler_schedule SET status='exhausted' WHERE name='once'",
+		"UPDATE scheduler_schedule SET next_due_at=run_at+interval '1 second' WHERE name='once'",
+	} {
+		if _, err := pool.Exec(ctx, sql); err == nil {
+			t.Fatalf("constraint accepted %s", sql)
+		}
+	}
+	clock.Advance(time.Minute)
+	var wait sync.WaitGroup
+	for _, worker := range []string{"once-worker-a", "once-worker-b"} {
+		planner, _ := application.NewPlanner(store, clock, recurrence.NewCalculator(), worker, time.Minute, 10)
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			if err := planner.Run(ctx); err != nil {
+				t.Errorf("planner: %v", err)
+			}
+		}()
+	}
+	wait.Wait()
+	current, err = service.Get(ctx, "tenant-a", "once")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Status != domain.ScheduleStatus("exhausted") || !current.NextDueAt.IsZero() || current.Version != 2 || current.ClaimOwner != "" {
+		t.Fatalf("exhausted=%#v", current)
+	}
+	for _, table := range []string{"scheduler_occurrence", "scheduler_dispatch_outbox"} {
+		var count int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM "+pgx.Identifier{table}.Sanitize()).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("%s=%d err=%v", table, count, err)
+		}
+	}
+	clock.Advance(24 * time.Hour)
+	// A rebuilt application must replay the original future-valid command after due.
+	rebuilt, _ := application.NewService(store, clock, recurrence.NewCalculator())
+	command.RequestID = "req-replay-after-due"
+	receipt, err := rebuilt.Execute(ctx, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.RequestID != "req-once-create" || !receipt.Result.Schedule.NextDueAt.Equal(command.Schedule.RunAt) || receipt.Result.Schedule.Status != domain.ScheduleActive {
+		t.Fatalf("replayed=%#v", receipt)
+	}
+	var afterBody string
+	if err := pool.QueryRow(ctx, "SELECT result_body::text FROM scheduler_command_receipt WHERE idempotency_key='once-create'").Scan(&afterBody); err != nil || afterBody != originalBody {
+		t.Fatal("old receipt was rewritten")
+	}
+	newPast := command
+	newPast.IdempotencyKey = "new-past-key"
+	if _, err := rebuilt.Execute(ctx, newPast); !errors.Is(err, application.ErrInvalidCommand) {
+		t.Fatalf("new past command err=%v", err)
+	}
+	for _, op := range []domain.CommandOperation{domain.CommandPause, domain.CommandResume} {
+		control := command
+		control.Operation = op
+		control.IdempotencyKey = string(op) + "-exhausted"
+		control.CommandScope = string(op) + ":once"
+		got, err := rebuilt.Execute(ctx, control)
+		if err != nil || got.Result.Code != "schedule_exhausted" {
+			t.Fatalf("%s result=%#v err=%v", op, got, err)
+		}
+	}
+	// Editing this same trigger after consumption cannot create a second execution,
+	// even when the command ACK is lost or the clock later moves backwards.
+	edit := command
+	edit.Operation = domain.CommandUpdate
+	edit.CommandScope = "PUT:once"
+	edit.IdempotencyKey = "edit-exhausted-once"
+	edit.Schedule.Status = domain.SchedulePaused
+	edit.Schedule.Payload = []byte(`{"revision":2}`)
+	fault.lose = true
+	if _, err := service.Execute(ctx, edit); err == nil {
+		t.Fatal("committed edit with lost ACK must remain unknown")
+	}
+	edited, err := rebuilt.Execute(ctx, edit)
+	if err != nil || edited.Result.Code != domain.ResultUpdated || edited.Result.Schedule.Status != domain.ScheduleExhausted || !edited.Result.Schedule.NextDueAt.IsZero() {
+		t.Fatalf("exhausted edit=%#v err=%v", edited, err)
+	}
+	var editedPayload map[string]int
+	if err := json.Unmarshal(edited.Result.Schedule.Payload, &editedPayload); err != nil || !reflect.DeepEqual(editedPayload, map[string]int{"revision": 2}) {
+		t.Fatalf("edited payload=%s err=%v", edited.Result.Schedule.Payload, err)
+	}
+	clock.Advance(-48 * time.Hour)
+	edit.IdempotencyKey = "edit-exhausted-clock-rollback"
+	edit.Schedule.Status = domain.ScheduleActive
+	if result, err := rebuilt.Execute(ctx, edit); err != nil || result.Result.Schedule.Status != domain.ScheduleExhausted || !result.Result.Schedule.NextDueAt.IsZero() {
+		t.Fatalf("clock rollback revived trigger: %#v err=%v", result, err)
+	}
+	clock.Advance(48 * time.Hour)
+	var originalQueuedPayload bool
+	if err := pool.QueryRow(ctx, `SELECT payload = '{}'::jsonb FROM scheduler_dispatch_outbox`).Scan(&originalQueuedPayload); err != nil || !originalQueuedPayload {
+		t.Fatalf("consumed edit changed queued payload: original=%v err=%v", originalQueuedPayload, err)
+	}
+	// Exhaustion stops new occurrences, not the already committed retry outbox.
+	target := &doubles.TargetClient{Results: []domain.DispatchResult{{Status: 503}, {Status: 202}}}
+	dispatcher, _ := application.NewDispatcher(application.DispatcherDependencies{Store: store, Clock: clock, Random: &doubles.RandomSource{}, Target: target, WorkerID: "once-delivery"})
+	if err := dispatcher.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(time.Second)
+	if err := dispatcher.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if target.CallCount() != 2 {
+		t.Fatalf("retry calls=%d", target.CallCount())
+	}
+	var outcome string
+	if err := pool.QueryRow(ctx, "SELECT status FROM scheduler_occurrence").Scan(&outcome); err != nil || outcome != "succeeded" {
+		t.Fatalf("outcome=%s err=%v", outcome, err)
+	}
+	planner, _ := application.NewPlanner(store, clock, recurrence.NewCalculator(), "rebuilt-planner", time.Minute, 10)
+	if err := planner.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM scheduler_occurrence").Scan(&count); err != nil || count != 1 {
+		t.Fatal("exhausted schedule generated another occurrence")
+	}
+	future := command
+	future.Operation = domain.CommandUpdate
+	future.CommandScope = "PUT:once"
+	future.IdempotencyKey = "replace-once"
+	future.Schedule.RunAt = clock.Now().Add(time.Hour)
+	if _, err := rebuilt.Execute(ctx, future); err != nil {
+		t.Fatal(err)
+	}
+	current, err = rebuilt.Get(ctx, "tenant-a", "once")
+	if err != nil || current.Status != domain.ScheduleActive || !current.NextDueAt.Equal(future.Schedule.RunAt) {
+		t.Fatalf("replacement=%#v err=%v", current, err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM scheduler_occurrence").Scan(&count); err != nil || count != 1 {
+		t.Fatal("replacement changed historical occurrences")
+	}
+}
+
+func TestPostgresOnceResumeKeepsOriginalDueAndMisfirePolicy(t *testing.T) {
+	for _, policy := range []domain.MisfirePolicy{domain.MisfireSkip, domain.MisfireFireOnce, domain.MisfireCatchUpBounded} {
+		t.Run(string(policy), func(t *testing.T) {
+			store, pool := openIntegrationStore(t)
+			ctx := context.Background()
+			clock := doubles.NewClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+			service, _ := application.NewService(store, clock, recurrence.NewCalculator())
+			command := createCommand("tenant-a", "paused-once", "paused-create", "req-create")
+			command.Schedule.Rule = ""
+			command.Schedule.RunAt = clock.Now().Add(time.Minute)
+			command.Schedule.Status = domain.SchedulePaused
+			command.Schedule.MisfirePolicy = policy
+			if _, err := service.Execute(ctx, command); err != nil {
+				t.Fatal(err)
+			}
+			clock.Advance(5 * time.Minute)
+			edit := command
+			edit.Operation = domain.CommandUpdate
+			edit.CommandScope = "PUT:paused-once"
+			edit.IdempotencyKey = "edit-paused-past-once"
+			edit.Schedule.Payload = []byte(`{"revision":2}`)
+			if result, err := service.Execute(ctx, edit); err != nil || result.Result.Schedule.Status != domain.SchedulePaused || !result.Result.Schedule.NextDueAt.Equal(command.Schedule.RunAt) {
+				t.Fatalf("paused edit lost original due: %#v err=%v", result, err)
+			}
+			resume := command
+			resume.Operation = domain.CommandResume
+			resume.CommandScope = "resume:once"
+			resume.IdempotencyKey = "resume-once"
+			ack, err := service.Execute(ctx, resume)
+			if err != nil || !ack.Result.Schedule.NextDueAt.Equal(command.Schedule.RunAt) {
+				t.Fatalf("resume=%#v err=%v", ack, err)
+			}
+			edit.IdempotencyKey = "edit-active-past-once"
+			edit.Schedule.Status = domain.ScheduleActive
+			if result, err := service.Execute(ctx, edit); err != nil || result.Result.Schedule.Status != domain.ScheduleActive || !result.Result.Schedule.NextDueAt.Equal(command.Schedule.RunAt) {
+				t.Fatalf("active edit lost original misfire position: %#v err=%v", result, err)
+			}
+			planner, _ := application.NewPlanner(store, clock, recurrence.NewCalculator(), "resume-planner", time.Minute, 10)
+			if err := planner.Run(ctx); err != nil {
+				t.Fatal(err)
+			}
+			var status string
+			var outbox int
+			if err := pool.QueryRow(ctx, "SELECT status FROM scheduler_occurrence").Scan(&status); err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.QueryRow(ctx, "SELECT count(*) FROM scheduler_dispatch_outbox").Scan(&outbox); err != nil {
+				t.Fatal(err)
+			}
+			want := "pending"
+			wantOutbox := 1
+			if policy == domain.MisfireSkip {
+				want = "skipped"
+				wantOutbox = 0
+			}
+			if status != want || outbox != wantOutbox {
+				t.Fatalf("status=%s outbox=%d", status, outbox)
+			}
+			current, err := service.Get(ctx, "tenant-a", "paused-once")
+			if err != nil || string(current.Status) != "exhausted" || !current.NextDueAt.IsZero() {
+				t.Fatalf("current=%#v err=%v", current, err)
+			}
+		})
+	}
+}
+
+func TestPostgresOnceStaleAndCancelledMaterializationRollBack(t *testing.T) {
+	store, pool := openIntegrationStore(t)
+	ctx := context.Background()
+	clock := doubles.NewClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	service, _ := application.NewService(store, clock, recurrence.NewCalculator())
+	command := createCommand("tenant-a", "once-fenced", "fenced-create", "req-fenced")
+	command.Schedule.Rule = ""
+	command.Schedule.RunAt = clock.Now().Add(time.Minute)
+	if _, err := service.Execute(ctx, command); err != nil {
+		t.Fatal(err)
+	}
+	claim := func(worker string) domain.Schedule {
+		t.Helper()
+		var schedules []domain.Schedule
+		if err := store.WithinTx(ctx, func(tx ports.TxStore) error {
+			var err error
+			schedules, err = tx.ClaimDueSchedules(ctx, clock.Now(), worker, clock.Now().Add(time.Minute), 10)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if len(schedules) != 1 {
+			t.Fatalf("claims=%d", len(schedules))
+		}
+		return schedules[0]
+	}
+	materialize := func(schedule domain.Schedule, worker string, cancelBeforeAdvance bool) error {
+		return store.WithinTx(ctx, func(tx ports.TxStore) error {
+			plan := domain.OccurrencePlan{ScheduledAt: schedule.RunAt, ObservedAt: clock.Now(), Status: domain.OccurrencePending, MissedCount: 1, Dispatch: true}
+			id, inserted, err := tx.InsertOccurrence(ctx, schedule, plan)
+			if err != nil {
+				return err
+			}
+			if !inserted {
+				return errors.New("fixture duplicate occurrence")
+			}
+			if err := tx.InsertDispatchOutbox(ctx, schedule, id, plan); err != nil {
+				return err
+			}
+			advanceContext := ctx
+			if cancelBeforeAdvance {
+				cancelled, cancel := context.WithCancel(ctx)
+				cancel()
+				advanceContext = cancelled
+			}
+			return tx.AdvanceSchedule(advanceContext, schedule, worker, time.Time{}, clock.Now())
+		})
+	}
+	assertNoExecutions := func() {
+		t.Helper()
+		for _, table := range []string{"scheduler_occurrence", "scheduler_dispatch_outbox"} {
+			var count int
+			if err := pool.QueryRow(ctx, "SELECT count(*) FROM "+pgx.Identifier{table}.Sanitize()).Scan(&count); err != nil || count != 0 {
+				t.Fatalf("%s partial writes=%d err=%v", table, count, err)
+			}
+		}
+	}
+	clock.Advance(time.Minute)
+	stale := claim("stale-once")
+	replacement := command
+	replacement.Operation = domain.CommandUpdate
+	replacement.CommandScope = "PUT:once-fenced"
+	replacement.IdempotencyKey = "replace-fenced"
+	replacement.Schedule.RunAt = clock.Now().Add(time.Hour)
+	if _, err := service.Execute(ctx, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if err := materialize(stale, "stale-once", false); !errors.Is(err, domain.ErrClaimLost) {
+		t.Fatalf("stale materialization err=%v", err)
+	}
+	assertNoExecutions()
+	if err := store.WithinTx(ctx, func(tx ports.TxStore) error {
+		_, err := tx.SetScheduleStatus(ctx, stale, domain.SchedulePaused, time.Time{}, clock.Now())
+		return err
+	}); !errors.Is(err, domain.ErrScheduleChanged) {
+		t.Fatalf("stale lifecycle err=%v", err)
+	}
+	current, err := service.Get(ctx, "tenant-a", "once-fenced")
+	if err != nil || current.Status != domain.ScheduleActive || !current.NextDueAt.Equal(replacement.Schedule.RunAt) {
+		t.Fatalf("current=%#v err=%v", current, err)
+	}
+	clock.Advance(time.Hour)
+	cancelledClaim := claim("cancelled-once")
+	if err := materialize(cancelledClaim, "cancelled-once", true); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled materialization err=%v", err)
+	}
+	assertNoExecutions()
+	clock.Advance(2 * time.Minute)
+	planner, _ := application.NewPlanner(store, clock, recurrence.NewCalculator(), "recovery-once", time.Minute, 10)
+	if err := planner.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	current, err = service.Get(ctx, "tenant-a", "once-fenced")
+	if err != nil || current.Status != domain.ScheduleExhausted || !current.NextDueAt.IsZero() {
+		t.Fatalf("recovery=%#v err=%v", current, err)
+	}
+	if err := store.WithinTx(ctx, func(tx ports.TxStore) error {
+		_, err := tx.SetScheduleStatus(ctx, cancelledClaim, domain.ScheduleActive, cancelledClaim.RunAt, clock.Now())
+		return err
+	}); !errors.Is(err, domain.ErrScheduleExhausted) {
+		t.Fatalf("late resume err=%v", err)
+	}
+	// Deleting and recreating the same name can reuse version=1, but not identity.
+	aba := command
+	aba.Name = "once-aba"
+	aba.IdempotencyKey = "aba-create"
+	aba.CommandScope = "POST:once-aba"
+	aba.Schedule.RunAt = clock.Now().Add(time.Hour)
+	if _, err := service.Execute(ctx, aba); err != nil {
+		t.Fatal(err)
+	}
+	before, err := service.Get(ctx, "tenant-a", "once-aba")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteCommand := aba
+	deleteCommand.Operation = domain.CommandDelete
+	deleteCommand.CommandScope = "DELETE:once-aba"
+	deleteCommand.IdempotencyKey = "aba-delete"
+	if _, err := service.Execute(ctx, deleteCommand); err != nil {
+		t.Fatal(err)
+	}
+	aba.IdempotencyKey = "aba-recreate"
+	if _, err := service.Execute(ctx, aba); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WithinTx(ctx, func(tx ports.TxStore) error {
+		_, err := tx.SetScheduleStatus(ctx, before, domain.SchedulePaused, time.Time{}, clock.Now())
+		return err
+	}); !errors.Is(err, domain.ErrScheduleChanged) {
+		t.Fatalf("ABA lifecycle err=%v", err)
+	}
+	after, err := service.Get(ctx, "tenant-a", "once-aba")
+	if err != nil || after.ID == before.ID || after.Version != 1 || after.Status != domain.ScheduleActive {
+		t.Fatalf("ABA=%#v err=%v", after, err)
+	}
+}
+
+func TestPostgresOnceHTTPCurrentAndOriginalReceiptRemainDistinct(t *testing.T) {
+	store, _ := openIntegrationStore(t)
+	clock := doubles.NewClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	service, _ := application.NewService(store, clock, recurrence.NewCalculator())
+	server := httptest.NewServer(transporthttp.NewHTTPHandler(service, "once-fixture", nil))
+	defer server.Close()
+	client := &http.Client{Timeout: 3 * time.Second}
+	call := func(method, payload, id, key string) (int, string, string) {
+		t.Helper()
+		req, err := http.NewRequest(method, server.URL+"/internal/scheduler/v1/schedules/once-http", strings.NewReader(payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer once-fixture")
+		req.Header.Set("X-Kokoro-Tenant-Id", "tenant-a")
+		req.Header.Set("X-Request-Id", id)
+		if key != "" {
+			req.Header.Set("Idempotency-Key", key)
+		}
+		if payload != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		res, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		data, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.StatusCode, string(data), res.Header.Get("X-Request-Id")
+	}
+	body := `{"run_at":"2026-01-01T00:01:00Z","url":"http://service.test/command"}`
+	status, original, requestID := call(http.MethodPost, body, "req-original-once", "http-once-create")
+	if status != 200 || !strings.Contains(original, `"run_at":"2026-01-01T00:01:00Z"`) {
+		t.Fatalf("create=%d %s", status, original)
+	}
+	clock.Advance(2 * time.Minute)
+	planner, _ := application.NewPlanner(store, clock, recurrence.NewCalculator(), "once-http-planner", time.Minute, 10)
+	if err := planner.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	status, current, _ := call(http.MethodGet, "", "req-current-once", "")
+	if status != 200 || !strings.Contains(current, `"status":"exhausted"`) || !strings.Contains(current, `"next_due_at":null`) {
+		t.Fatalf("current=%d %s", status, current)
+	}
+	status, replay, replayID := call(http.MethodPost, body, "req-replay-once", "http-once-create")
+	if status != 200 || replay != original || replayID != requestID {
+		t.Fatalf("replay=%d %s", status, replay)
+	}
+	status, invalid, _ := call(http.MethodPost, body, "req-past-new", "http-new-key")
+	if status != 400 {
+		t.Fatalf("new past input=%d %s", status, invalid)
+	}
+	editBody := `{"run_at":"2026-01-01T00:01:00Z","url":"http://service.test/command","paused":true,"body":{"revision":2}}`
+	status, edit, _ := call(http.MethodPut, editBody, "req-edit-once", "http-edit-once")
+	if status != 200 || !strings.Contains(edit, `"next_due_at":null`) || !strings.Contains(edit, `"paused":false`) || !strings.Contains(edit, `"status":"updated"`) {
+		t.Fatalf("consumed edit=%d %s", status, edit)
+	}
+	status, conflict, _ := call(http.MethodPut, strings.Replace(editBody, `"revision":2`, `"revision":3`, 1), "req-conflicting-edit", "http-edit-once")
+	if status != 409 || !strings.Contains(conflict, `"idempotency_conflict"`) {
+		t.Fatalf("changed body reused key=%d %s", status, conflict)
+	}
+	status, invalid, _ = call(http.MethodPut, strings.Replace(editBody, "00:01:00Z", "00:01:01Z", 1), "req-different-past", "http-different-past")
+	if status != 400 {
+		t.Fatalf("new past trigger=%d %s", status, invalid)
+	}
+	status, replay, _ = call(http.MethodPost, body, "req-original-again", "http-once-create")
+	if status != 200 || replay != original {
+		t.Fatal("new edit changed original ACK")
+	}
+}
+
+// Hold a real transaction after its read, without taking the schedule row lock.
+// A competing commit must invalidate that read rather than be silently overwritten.
+type replaceReadGateStore struct {
+	ports.Store
+	read, release chan struct{}
+}
+
+func (s *replaceReadGateStore) WithinTx(ctx context.Context, work func(ports.TxStore) error) error {
+	return s.Store.WithinTx(ctx, func(tx ports.TxStore) error {
+		return work(&replaceReadGateTx{TxStore: tx, read: s.read, release: s.release})
+	})
+}
+
+type replaceReadGateTx struct {
+	ports.TxStore
+	read, release chan struct{}
+}
+
+func (s *replaceReadGateTx) GetSchedule(ctx context.Context, tenant, name string) (domain.Schedule, error) {
+	current, err := s.TxStore.GetSchedule(ctx, tenant, name)
+	if err != nil {
+		return domain.Schedule{}, err
+	}
+	close(s.read)
+	select {
+	case <-s.release:
+		return current, nil
+	case <-ctx.Done():
+		return domain.Schedule{}, ctx.Err()
+	}
+}
+
+func TestPostgresOnceReplaceFencesConcurrentConsumptionAndIdentity(t *testing.T) {
+	for _, winner := range []string{"planner", "replace", "delete-recreate", "delete", "cancel"} {
+		t.Run(winner, func(t *testing.T) {
+			store, pool := openIntegrationStore(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			clock := doubles.NewClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+			service, _ := application.NewService(store, clock, recurrence.NewCalculator())
+			create := createCommand("tenant-a", "once-race", "race-create", "req-race")
+			create.Schedule.Rule = ""
+			create.Schedule.RunAt = clock.Now().Add(time.Minute)
+			if _, err := service.Execute(ctx, create); err != nil {
+				t.Fatal(err)
+			}
+			clock.Advance(time.Minute)
+			gate := &replaceReadGateStore{Store: store, read: make(chan struct{}), release: make(chan struct{})}
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(gate.release) }) }
+			defer release()
+			staleService, _ := application.NewService(gate, clock, recurrence.NewCalculator())
+			edit := create
+			edit.Operation = domain.CommandUpdate
+			edit.CommandScope = "PUT:once-race"
+			edit.IdempotencyKey = "stale-replace"
+			edit.Schedule.Payload = []byte(`{"writer":"stale"}`)
+			type outcome struct {
+				receipt domain.CommandReceipt
+				err     error
+			}
+			done := make(chan outcome, 1)
+			go func() {
+				receipt, err := staleService.Execute(ctx, edit)
+				done <- outcome{receipt, err}
+			}()
+			select {
+			case <-gate.read:
+			case result := <-done:
+				t.Fatalf("replace failed before current read: %v", result.err)
+			case <-ctx.Done():
+				t.Fatal("current-read gate timed out")
+			}
+			planner, _ := application.NewPlanner(store, clock, recurrence.NewCalculator(), "race-planner", time.Minute, 10)
+			switch winner {
+			case "planner":
+				if err := planner.Run(ctx); err != nil {
+					t.Fatal(err)
+				}
+			case "replace":
+				other := edit
+				other.IdempotencyKey = "winning-replace"
+				other.Schedule.Payload = []byte(`{"writer":"winner"}`)
+				if _, err := service.Execute(ctx, other); err != nil {
+					t.Fatal(err)
+				}
+			case "delete-recreate", "delete":
+				remove := create
+				remove.Operation = domain.CommandDelete
+				remove.CommandScope = "DELETE:once-race"
+				remove.IdempotencyKey = "race-delete"
+				if _, err := service.Execute(ctx, remove); err != nil {
+					t.Fatal(err)
+				}
+				if winner == "delete-recreate" {
+					create.IdempotencyKey = "race-recreate"
+					create.Schedule.RunAt = clock.Now().Add(time.Hour)
+					if _, err := service.Execute(ctx, create); err != nil {
+						t.Fatal(err)
+					}
+				}
+			case "cancel":
+				cancel()
+			}
+			release()
+			var result outcome
+			select {
+			case result = <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("replace did not settle")
+			}
+			if winner == "cancel" {
+				if !errors.Is(result.err, context.Canceled) {
+					t.Fatalf("cancel err=%v", result.err)
+				}
+				var receipts int
+				if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM scheduler_command_receipt WHERE idempotency_key='stale-replace'`).Scan(&receipts); err != nil || receipts != 0 {
+					t.Fatalf("cancelled command persisted receipt: count=%d err=%v", receipts, err)
+				}
+				current, err := service.Get(context.Background(), "tenant-a", "once-race")
+				if err != nil || current.Version != 1 || current.Status != domain.ScheduleActive || !current.NextDueAt.Equal(create.Schedule.RunAt) {
+					t.Fatalf("cancelled command changed current: %#v err=%v", current, err)
+				}
+			} else {
+				want := domain.ResultChanged
+				if winner == "delete" {
+					want = domain.ResultNotFound
+				}
+				if result.err != nil || result.receipt.Result.Code != want {
+					t.Fatalf("stale replace=%#v err=%v", result.receipt, result.err)
+				}
+				replay, err := service.Execute(context.Background(), edit)
+				if err != nil || replay.Result.Code != want {
+					t.Fatalf("conflict replay=%#v err=%v", replay, err)
+				}
+			}
+			var staleWrites int
+			if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM scheduler_schedule WHERE payload->>'writer'='stale'`).Scan(&staleWrites); err != nil || staleWrites != 0 {
+				t.Fatalf("stale writes=%d err=%v", staleWrites, err)
+			}
+			if winner == "replace" {
+				if err := planner.Run(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				var payload string
+				if err := pool.QueryRow(context.Background(), `SELECT payload->>'writer' FROM scheduler_dispatch_outbox`).Scan(&payload); err != nil || payload != "winner" {
+					t.Fatalf("queued payload=%s err=%v", payload, err)
+				}
+			}
+		})
+	}
 }

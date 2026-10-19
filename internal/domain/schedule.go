@@ -38,13 +38,16 @@ const (
 	OverlapAllow  OverlapPolicy = "allow"
 	OverlapForbid OverlapPolicy = "forbid"
 
-	ScheduleActive ScheduleStatus = "active"
-	SchedulePaused ScheduleStatus = "paused"
+	ScheduleActive    ScheduleStatus = "active"
+	SchedulePaused    ScheduleStatus = "paused"
+	ScheduleExhausted ScheduleStatus = "exhausted"
 )
 
 var (
 	ErrScheduleAlreadyExists = errors.New("scheduler schedule already exists")
 	ErrScheduleNotFound      = errors.New("scheduler schedule not found")
+	ErrScheduleExhausted     = errors.New("scheduler schedule is exhausted")
+	ErrScheduleChanged       = errors.New("scheduler schedule changed")
 	ErrClaimLost             = errors.New("scheduler persistence claim is no longer owned")
 	scheduleNamePattern      = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 )
@@ -108,6 +111,7 @@ type Schedule struct {
 	TenantID       string
 	Name           string
 	Rule           string
+	RunAt          time.Time `json:",omitzero"`
 	Timezone       string
 	TargetURL      string
 	Method         Method
@@ -161,6 +165,7 @@ func (s Schedule) Normalized() (Schedule, error) {
 		return Schedule{}, err
 	}
 	s.Payload = canonicalPayload
+	s.RunAt = NormalizeInstant(s.RunAt)
 	s.NextDueAt = NormalizeInstant(s.NextDueAt)
 	s.CreatedAt = NormalizeInstant(s.CreatedAt)
 	s.UpdatedAt = NormalizeInstant(s.UpdatedAt)
@@ -175,8 +180,8 @@ func (s Schedule) Validate() error {
 	if !scheduleNamePattern.MatchString(s.Name) {
 		return fmt.Errorf("schedule name %q is invalid", s.Name)
 	}
-	if s.Rule == "" || len(s.Rule) > 256 {
-		return errors.New("schedule rule must contain between 1 and 256 characters")
+	if (s.Rule == "") == s.RunAt.IsZero() || len(s.Rule) > 256 {
+		return errors.New("exactly one of schedule rule or run_at is required")
 	}
 	if strings.HasPrefix(s.Rule, "TZ=") || strings.HasPrefix(s.Rule, "CRON_TZ=") {
 		return errors.New("schedule timezone must use the timezone field")
@@ -215,8 +220,14 @@ func (s Schedule) Validate() error {
 	if s.OverlapPolicy != OverlapAllow && s.OverlapPolicy != OverlapForbid {
 		return fmt.Errorf("schedule %q has invalid overlap_policy %q", s.Name, s.OverlapPolicy)
 	}
-	if s.Status != ScheduleActive && s.Status != SchedulePaused {
+	if s.Status != ScheduleActive && s.Status != SchedulePaused && s.Status != ScheduleExhausted {
 		return fmt.Errorf("schedule %q has invalid status %q", s.Name, s.Status)
+	}
+	if s.Status == ScheduleExhausted && (s.RunAt.IsZero() || !s.NextDueAt.IsZero() || s.ClaimOwner != "" || !s.ClaimExpiresAt.IsZero()) {
+		return errors.New("exhausted schedule must be once with no next due or claim")
+	}
+	if !s.RunAt.IsZero() && !s.NextDueAt.IsZero() && !NormalizeInstant(s.RunAt).Equal(NormalizeInstant(s.NextDueAt)) {
+		return errors.New("once next due must equal run_at")
 	}
 	return nil
 }

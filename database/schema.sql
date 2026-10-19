@@ -2,7 +2,8 @@ CREATE TABLE IF NOT EXISTS scheduler_schedule (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id TEXT NOT NULL,
     name TEXT NOT NULL,
-    schedule_rule TEXT NOT NULL,
+    schedule_rule TEXT,
+    run_at TIMESTAMPTZ(3),
     timezone TEXT NOT NULL,
     target_url TEXT NOT NULL,
     target_method TEXT NOT NULL,
@@ -15,7 +16,7 @@ CREATE TABLE IF NOT EXISTS scheduler_schedule (
     retry_backoff_seconds INTEGER NOT NULL DEFAULT 1,
     retry_max_backoff_seconds INTEGER NOT NULL DEFAULT 3600,
     retry_window_seconds INTEGER NOT NULL DEFAULT 3600,
-    next_due_at TIMESTAMPTZ(3) NOT NULL,
+    next_due_at TIMESTAMPTZ(3),
     claim_owner TEXT,
     claim_expires_at TIMESTAMPTZ(3),
     version BIGINT NOT NULL DEFAULT 1,
@@ -24,11 +25,19 @@ CREATE TABLE IF NOT EXISTS scheduler_schedule (
     CONSTRAINT uq_scheduler_schedule_tenant_name UNIQUE (tenant_id, name),
     CONSTRAINT ck_scheduler_schedule_tenant CHECK (tenant_id <> '' AND length(tenant_id) <= 128),
     CONSTRAINT ck_scheduler_schedule_name CHECK (name ~ '^[a-z0-9][a-z0-9._-]{0,63}$'),
-    CONSTRAINT ck_scheduler_schedule_rule CHECK (schedule_rule <> '' AND length(schedule_rule) <= 256),
+    CONSTRAINT ck_scheduler_schedule_rule CHECK (
+        (schedule_rule IS NOT NULL AND schedule_rule <> '' AND length(schedule_rule) <= 256 AND run_at IS NULL)
+        OR (schedule_rule IS NULL AND run_at IS NOT NULL)
+    ),
     CONSTRAINT ck_scheduler_schedule_timezone CHECK (timezone <> '' AND length(timezone) <= 128),
     CONSTRAINT ck_scheduler_schedule_target_method CHECK (target_method IN ('POST', 'PUT')),
     CONSTRAINT ck_scheduler_schedule_payload CHECK (jsonb_typeof(payload) = 'object'),
-    CONSTRAINT ck_scheduler_schedule_status CHECK (status IN ('active', 'paused')),
+    CONSTRAINT ck_scheduler_schedule_status CHECK (status IN ('active', 'paused', 'exhausted')),
+    CONSTRAINT ck_scheduler_schedule_next CHECK (
+        (status = 'exhausted' AND run_at IS NOT NULL AND next_due_at IS NULL AND claim_owner IS NULL AND claim_expires_at IS NULL)
+        OR (status IN ('active', 'paused') AND next_due_at IS NOT NULL AND (run_at IS NULL OR next_due_at = run_at))
+    ),
+    CONSTRAINT ck_scheduler_schedule_paused_claim CHECK (status <> 'paused' OR (claim_owner IS NULL AND claim_expires_at IS NULL)),
     CONSTRAINT ck_scheduler_schedule_misfire CHECK (misfire_policy IN ('skip', 'fire_once', 'catch_up_bounded')),
     CONSTRAINT ck_scheduler_schedule_catch_up CHECK (
         (misfire_policy = 'catch_up_bounded' AND catch_up_limit BETWEEN 1 AND 100)

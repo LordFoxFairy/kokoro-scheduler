@@ -42,6 +42,27 @@ func NewService(store ports.Store, clock ports.Clock, recurrence ports.Recurrenc
 	return &Service{store: store, clock: clock, recurrence: recurrence}, nil
 }
 
+// Get reads the current row, never a mutation receipt. Tenant scope is validated
+// again here so non-HTTP callers cannot bypass the resource boundary.
+func (s *Service) Get(ctx context.Context, tenantID, name string) (domain.Schedule, error) {
+	if err := domain.ValidateTenantID(tenantID); err != nil {
+		return domain.Schedule{}, errors.Join(ErrInvalidCommand, err)
+	}
+	if !domain.IsValidScheduleName(name) {
+		return domain.Schedule{}, ErrInvalidCommand
+	}
+	var schedule domain.Schedule
+	err := s.store.WithinTx(ctx, func(tx ports.TxStore) error {
+		var err error
+		schedule, err = tx.GetSchedule(ctx, tenantID, name)
+		return err
+	})
+	if err != nil {
+		return domain.Schedule{}, err
+	}
+	return schedule, nil
+}
+
 func (s *Service) Execute(ctx context.Context, command Command) (domain.CommandReceipt, error) {
 	prepared, err := s.prepare(command)
 	if err != nil {
@@ -104,16 +125,14 @@ func (s *Service) prepare(command Command) (Command, error) {
 		if err != nil {
 			return Command{}, errors.Join(ErrInvalidCommand, err)
 		}
-		if err := s.recurrence.Validate(normalized.Rule, normalized.Timezone); err != nil {
-			return Command{}, errors.Join(ErrInvalidCommand, err)
+		if normalized.Status == domain.ScheduleExhausted {
+			return Command{}, ErrInvalidCommand
 		}
-		now := domain.NormalizeInstant(s.clock.Now())
-		normalized.NextDueAt, err = s.recurrence.Next(normalized.Rule, normalized.Timezone, now)
-		if err != nil {
-			return Command{}, errors.Join(ErrInvalidCommand, err)
+		if normalized.RunAt.IsZero() {
+			if err := s.recurrence.Validate(normalized.Rule, normalized.Timezone); err != nil {
+				return Command{}, errors.Join(ErrInvalidCommand, err)
+			}
 		}
-		normalized.CreatedAt = now
-		normalized.UpdatedAt = now
 		command.Schedule = normalized
 	case domain.CommandDelete, domain.CommandPause, domain.CommandResume:
 	default:
@@ -124,6 +143,39 @@ func (s *Service) prepare(command Command) (Command, error) {
 
 func (s *Service) apply(ctx context.Context, tx ports.TxStore, command Command) (domain.CommandResult, error) {
 	now := domain.NormalizeInstant(s.clock.Now())
+	// A replay was already resolved before reaching this time-dependent check.
+	var current domain.Schedule
+	if command.Operation == domain.CommandCreate || command.Operation == domain.CommandUpdate {
+		if command.Operation == domain.CommandUpdate {
+			var err error
+			current, err = tx.GetSchedule(ctx, command.TenantID, command.Name)
+			if errors.Is(err, domain.ErrScheduleNotFound) {
+				return domain.CommandResult{Code: domain.ResultNotFound, Name: command.Name}, nil
+			}
+			if err != nil {
+				return domain.CommandResult{}, err
+			}
+		}
+		if command.Operation == domain.CommandUpdate && !command.Schedule.RunAt.IsZero() && command.Schedule.RunAt.Equal(current.RunAt) {
+			command.Schedule.NextDueAt = current.NextDueAt
+			if current.Status == domain.ScheduleExhausted {
+				command.Schedule.Status = domain.ScheduleExhausted
+			}
+		} else if !command.Schedule.RunAt.IsZero() {
+			if !command.Schedule.RunAt.After(now) {
+				return domain.CommandResult{}, ErrInvalidCommand
+			}
+			command.Schedule.NextDueAt = command.Schedule.RunAt
+		} else {
+			var err error
+			command.Schedule.NextDueAt, err = s.recurrence.Next(command.Schedule.Rule, command.Schedule.Timezone, now)
+			if err != nil {
+				return domain.CommandResult{}, errors.Join(ErrInvalidCommand, err)
+			}
+		}
+		command.Schedule.CreatedAt = now
+		command.Schedule.UpdatedAt = now
+	}
 	switch command.Operation {
 	case domain.CommandCreate:
 		created, err := tx.CreateSchedule(ctx, command.Schedule)
@@ -132,9 +184,12 @@ func (s *Service) apply(ctx context.Context, tx ports.TxStore, command Command) 
 		}
 		return scheduleResult(domain.ResultRegistered, created, err)
 	case domain.CommandUpdate:
-		updated, err := tx.UpdateSchedule(ctx, command.Schedule)
+		updated, err := tx.UpdateSchedule(ctx, current, command.Schedule)
 		if errors.Is(err, domain.ErrScheduleNotFound) {
 			return domain.CommandResult{Code: domain.ResultNotFound, Name: command.Name}, nil
+		}
+		if errors.Is(err, domain.ErrScheduleChanged) {
+			return domain.CommandResult{Code: domain.ResultChanged, Name: command.Name}, nil
 		}
 		return scheduleResult(domain.ResultUpdated, updated, err)
 	case domain.CommandDelete:
@@ -143,13 +198,7 @@ func (s *Service) apply(ctx context.Context, tx ports.TxStore, command Command) 
 			return domain.CommandResult{Code: domain.ResultNotFound, Name: command.Name}, nil
 		}
 		return domain.CommandResult{Code: domain.ResultDeleted, Name: command.Name}, err
-	case domain.CommandPause:
-		paused, err := tx.SetScheduleStatus(ctx, command.TenantID, command.Name, domain.SchedulePaused, time.Time{}, now)
-		if errors.Is(err, domain.ErrScheduleNotFound) {
-			return domain.CommandResult{Code: domain.ResultNotFound, Name: command.Name}, nil
-		}
-		return scheduleResult(domain.ResultPaused, paused, err)
-	case domain.CommandResume:
+	case domain.CommandPause, domain.CommandResume:
 		current, err := tx.GetSchedule(ctx, command.TenantID, command.Name)
 		if errors.Is(err, domain.ErrScheduleNotFound) {
 			return domain.CommandResult{Code: domain.ResultNotFound, Name: command.Name}, nil
@@ -157,12 +206,28 @@ func (s *Service) apply(ctx context.Context, tx ports.TxStore, command Command) 
 		if err != nil {
 			return domain.CommandResult{}, err
 		}
-		nextDueAt, err := s.recurrence.Next(current.Rule, current.Timezone, now)
-		if err != nil {
-			return domain.CommandResult{}, err
+		if current.Status == domain.ScheduleExhausted {
+			return domain.CommandResult{Code: domain.ResultExhausted, Name: command.Name}, nil
 		}
-		resumed, err := tx.SetScheduleStatus(ctx, command.TenantID, command.Name, domain.ScheduleActive, nextDueAt, now)
-		return scheduleResult(domain.ResultResumed, resumed, err)
+		status, code := domain.SchedulePaused, domain.ResultPaused
+		var nextDueAt time.Time
+		if command.Operation == domain.CommandResume {
+			status, code = domain.ScheduleActive, domain.ResultResumed
+			nextDueAt = current.RunAt
+			if nextDueAt.IsZero() {
+				nextDueAt, err = s.recurrence.Next(current.Rule, current.Timezone, now)
+				if err != nil {
+					return domain.CommandResult{}, err
+				}
+			}
+		}
+		updated, err := tx.SetScheduleStatus(ctx, current, status, nextDueAt, now)
+		for target, result := range map[error]string{domain.ErrScheduleNotFound: domain.ResultNotFound, domain.ErrScheduleExhausted: domain.ResultExhausted, domain.ErrScheduleChanged: domain.ResultChanged} {
+			if errors.Is(err, target) {
+				return domain.CommandResult{Code: result, Name: command.Name}, nil
+			}
+		}
+		return scheduleResult(code, updated, err)
 	default:
 		return domain.CommandResult{}, ErrInvalidCommand
 	}

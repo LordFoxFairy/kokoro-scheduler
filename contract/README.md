@@ -1,3 +1,7 @@
+## 3.0.0 local candidate
+
+Same-trigger once replacement preserves consumption. Mutation Schedule.next_due_at may be null only for a consumed once trigger (run_at present, paused false); its historical field set is unchanged. Current lifecycle remains on GET. Concurrent replacement conflicts are durable 409 schedule_changed. Pair the fixed owner artifact with consumers before activation; existing receipt bodies are never rewritten.
+
 # kokoro-scheduler contract
 
 Canonical machine source: [`openapi/v1/openapi.yaml`](./openapi/v1/openapi.yaml). The file uses the JSON representation accepted by YAML 1.2 and OpenAPI 3.1, so the repository can parse it with Go's standard JSON decoder without a second generated source. Human-readable policy in [`../docs/API_CONTRACT.md`](../docs/API_CONTRACT.md) is explanatory only.
@@ -36,7 +40,7 @@ This command validates the canonical OpenAPI artifact and runs the contract/pari
 
 ## Breaking policy
 
-[`openapi/v1/breaking-policy.json`](./openapi/v1/breaking-policy.json) is the v1 compatibility signature. The gate fails when a protected path, method, Schedule input field, Occurrence field, dispatch header, retryable status, or stable control error mapping is removed. The canonical OpenAPI declares each operation's status-to-code mapping through `x-kokoro-control-error-codes`; the policy captures the required signature by `operationId`, and the contract test rejects any drift between the two. The protected owner codes are `schedule_already_exists` and `schedule_not_found`. Tightening constraints or changing semantics still requires owner review; an incompatible change must use a new major contract and coordinated consumer update rather than a runtime compatibility route.
+[`openapi/v1/breaking-policy.json`](./openapi/v1/breaking-policy.json) is the v1 compatibility signature. The gate fails when a protected path, method, Schedule input field, Occurrence field, dispatch header, retryable status, or stable control error mapping is removed. The canonical OpenAPI declares each operation's status-to-code mapping through `x-kokoro-control-error-codes`; the policy captures the required signature by `operationId`, and the contract test rejects any drift between the two. The protected owner codes include `schedule_already_exists`, `schedule_not_found`, `schedule_exhausted`, and `schedule_changed`, with exact HTTP/operation mapping in the policy. Tightening constraints or changing semantics still requires owner review; an incompatible change must use a new major contract and coordinated consumer update rather than a runtime compatibility route.
 
 Change order:
 

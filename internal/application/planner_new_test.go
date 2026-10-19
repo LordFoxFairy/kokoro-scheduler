@@ -1,6 +1,7 @@
 package application
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -74,5 +75,41 @@ func TestPlanScheduleBoundsCatchUpAndRecordsDroppedRemainder(t *testing.T) {
 	}
 	if want := now.Add(time.Minute); !next.Equal(want) {
 		t.Fatalf("next = %s, want %s", next, want)
+	}
+}
+
+func TestPlanAbsoluteOnceHasNoNextRecurrence(t *testing.T) {
+	due := time.Date(2026, 11, 1, 5, 30, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name     string
+		policy   domain.MisfirePolicy
+		late     bool
+		dispatch bool
+	}{
+		{"on time", domain.MisfireSkip, false, true},
+		{"late skip", domain.MisfireSkip, true, false},
+		{"late fire once", domain.MisfireFireOnce, true, true},
+		{"late bounded", domain.MisfireCatchUpBounded, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			schedule := scheduleDueAt(due, tc.policy, 1)
+			if err := json.Unmarshal([]byte(`{"Rule":"","RunAt":"2026-11-01T05:30:00Z"}`), &schedule); err != nil {
+				t.Fatal(err)
+			}
+			now := due
+			if tc.late {
+				now = due.Add(24 * time.Hour)
+			}
+			plans, next, err := planSchedule(schedule, now, minuteRecurrence{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(plans) != 1 || !next.IsZero() || plans[0].Dispatch != tc.dispatch || !plans[0].ScheduledAt.Equal(due) {
+				t.Fatalf("plans=%#v next=%s", plans, next)
+			}
+			if !tc.dispatch && plans[0].OutcomeCode != domain.CodeMisfireSkipped {
+				t.Fatal("misfire skip must remain observable")
+			}
+		})
 	}
 }
