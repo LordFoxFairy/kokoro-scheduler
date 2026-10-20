@@ -85,7 +85,7 @@ curl -fsS -X POST \
   }'
 ```
 
-当前状态使用同资源 `GET /internal/scheduler/v1/schedules/{name}` 读取，携带相同服务认证、可信 tenant 和 request ID，不传 body、query 或幂等键。返回当前 `data.schedule.status/next_due_at/version`，响应不缓存；原 mutation receipt 只代表首次操作结果，不会随 planner 推进而更新。一次性调度已在当前源码和隔离资源中实现，正常环境尚未升级；BFF/Agent/MCP消费接线仍待配对。
+当前状态使用同资源 `GET /internal/scheduler/v1/schedules/{name}` 读取，携带相同服务认证、可信 tenant 和 request ID，不传 body、query 或幂等键。返回当前 `data.schedule.status/next_due_at/version`，响应不缓存；原 mutation receipt 只代表首次操作结果，不会随 planner 推进而更新。一次性调度与当前读取已在源码、隔离资源及本地正常 Scheduler/BFF/Public17 页面配对验收；正常两条旧任务保持暂停。Agent/MCP 消费接线和实际任务执行仍未验收，模型与扣费保持暂停。
 
 API 时间均为 RFC3339 UTC；周期规则单独保存 IANA timezone。默认 misfire 为 `fire_once`，默认 overlap 为 `forbid`，每次跳过都会持久化 outcome，不存在无记录的 still-running skip。
 

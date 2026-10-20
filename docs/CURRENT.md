@@ -1,3 +1,13 @@
+## 2026-10-20 补录本地激活历史证据
+
+下列 2026-10-18 条目为当时的正常环境验收记录，不覆盖主线后继契约版本，不放行实际执行。
+
+## 2026-10-18 Scheduler3 正常本地配对完成（覆盖下文未加载说明）
+
+本地源码 3bb7ff6 已在用户授权的备份恢复演练后与 BFF Public17 配对加载。仅演进 scheduler_schedule 的一次性/耗尽所需列、nullable 与 canonical 检查约束；原两条 recurring schedule 均保持暂停，历史 receipt/occurrence/dispatch 保留。一个旧 daily payload 缺业务 revision，已由正式 replace 管理接口追加新回执修复，原回执未改；原 key/body 实际重放结果相同。
+
+正式 current reader 最终验证完整定义与 BFF 当前事实一致，两个 paused、next=null，occurrence/dispatch 均零；不是实际定时派发或 Agent/MCP 执行验收。本轮重新 go build 通过，既有 producer Go/真实 PG 完整证据保持。旧进程终止，自有恢复演练库均清理；没有新增常驻测试实例。原始收据只留 Root ignored var/dev/scheduled-normal17-20261018，模型、工具、扣费、CI与远端 PR 继续暂停。
+
 ## 2026-10-18 同触发源编辑：3.0 源码候选已实现
 
 基线8a26c91，同需求分支。已将同非零run_at的replace改为保原due/exhausted，新增当前id/version CAS与SQL nullable next；不同触发源/新建仍future，原receipt先重放、旧执行不改。canonical/manifest/breaking policy配对3.0.0：mutation next允许条件null、保原字段集，replace新增明确409 schedule_changed。本片为本地producer候选，后继BFF仍固定2.0 producer，不能正常激活或声称整链完成。
